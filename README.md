@@ -136,10 +136,10 @@ Inside a run, the worker sets `ECO_WORKER=1`. Your own scripts can check it and 
 
 ```bash
 git clone --depth 1 https://github.com/9thDuck/claude-cloud-env-tooling.git "$HOME/claude-cloud-env-tooling" \
-  && "$HOME/claude-cloud-env-tooling/install.sh"
+  && "$HOME/claude-cloud-env-tooling/install.sh" --no-key-check
 ```
 
-Store `ECO_WORKER_API_KEY` as an environment secret, not in the script.
+Store `ECO_WORKER_API_KEY` as an environment secret, not in the script. A setup script may run before secrets are visible, so `--no-key-check` skips that one check and says so; every other check still runs.
 
 ## Development
 

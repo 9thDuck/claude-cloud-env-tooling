@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 # Put eco-worker and diff-review on PATH and check what they need. Safe to run again.
-# Usage: ./install.sh            (links into ${INSTALL_BIN_DIR:-$HOME/.local/bin})
+# Usage: ./install.sh [--no-key-check]   (links into ${INSTALL_BIN_DIR:-$HOME/.local/bin})
+# --no-key-check: skip the ECO_WORKER_API_KEY check, for setup scripts that run before secrets are visible.
 # Prints one PASS or FAILED line per check and exits non-zero if any check failed.
 set -uo pipefail
 here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 bin="${INSTALL_BIN_DIR:-$HOME/.local/bin}"
 failed=0
+key_check=1
+case "${1:-}" in
+  "") ;;
+  --no-key-check) key_check=0 ;;
+  *) echo "FAILED unknown argument: $1 (usage: ./install.sh [--no-key-check])"; exit 2 ;;
+esac
 pass() { echo "PASS   $*"; }
 fail() { echo "FAILED $*"; failed=1; }
 
@@ -23,7 +30,8 @@ if type -P node > /dev/null; then
   if [ "$major" -ge 20 ]; then pass "node $major is 20 or newer"; else fail "node $major is older than 20"; fi
 fi
 case ":$PATH:" in *":$bin:"*) pass "$bin is on PATH";; *) fail "$bin is not on PATH (add: export PATH=\"$bin:\$PATH\")";; esac
-if [ -n "${ECO_WORKER_API_KEY:-}" ]; then pass "ECO_WORKER_API_KEY is set"; else fail "ECO_WORKER_API_KEY is not set (the API key for ${ECO_WORKER_BASE_URL:-https://api.synthetic.new/anthropic})"; fi
+if [ "$key_check" = 0 ]; then echo "SKIP   ECO_WORKER_API_KEY check (--no-key-check); set it before the first eco-worker run"
+elif [ -n "${ECO_WORKER_API_KEY:-}" ]; then pass "ECO_WORKER_API_KEY is set"; else fail "ECO_WORKER_API_KEY is not set (the API key for ${ECO_WORKER_BASE_URL:-https://api.synthetic.new/anthropic})"; fi
 
 if [ "$failed" = 0 ]; then echo "install: PASS"; else echo "install: FAILED (see the lines above)"; fi
 exit "$failed"
