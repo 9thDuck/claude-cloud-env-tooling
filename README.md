@@ -13,10 +13,11 @@ Both tools are plain Bash and Node scripts and need no build step.
 git clone https://github.com/9thDuck/claude-cloud-env-tooling.git ~/claude-cloud-env-tooling
 cd ~/claude-cloud-env-tooling
 export ECO_WORKER_API_KEY=...          # the API key for your endpoint (see below)
+export PATH="$HOME/.local/bin:$PATH"   # where install.sh puts the links
 ./install.sh
 ```
 
-`install.sh` puts `eco-worker` and `diff-review` on your PATH as links in `~/.local/bin`. Set `INSTALL_BIN_DIR` to link them somewhere else. The script then checks everything the tools need. It prints one `PASS` or `FAILED` line per check and exits non-zero if any check failed, so it is safe to run from a setup script. You can run it again at any time.
+`install.sh` puts `eco-worker` and `diff-review` on your PATH as links in `~/.local/bin`. Set `INSTALL_BIN_DIR` to link them somewhere else. That directory must already be on PATH. `install.sh` fails its PATH check until it is, so run the `export` line above first. To make it last, add that export line to your shell profile, for example `~/.bashrc`. If `INSTALL_BIN_DIR` is set, that directory must be on PATH instead. The script then checks everything the tools need. It prints one `PASS` or `FAILED` line per check and exits non-zero if any check failed, so it is safe to run from a setup script. You can run it again at any time.
 
 The tools need:
 
@@ -135,6 +136,7 @@ Inside a run, the worker sets `ECO_WORKER=1`. Your own scripts can check it and 
 ## In a cloud environment setup script
 
 ```bash
+export PATH="$HOME/.local/bin:$PATH"   # where install.sh puts the links
 git clone --depth 1 https://github.com/9thDuck/claude-cloud-env-tooling.git "$HOME/claude-cloud-env-tooling" \
   && "$HOME/claude-cloud-env-tooling/install.sh" --no-key-check
 ```
