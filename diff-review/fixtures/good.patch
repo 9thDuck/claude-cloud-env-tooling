@@ -1,0 +1,18 @@
+diff --git a/src/format-date.js b/src/format-date.js
+index 7c2e1a9..9d4b0f3 100644
+--- a/src/format-date.js
++++ b/src/format-date.js
+@@ -1,11 +1,12 @@
+ /**
+  * Format a date as YYYY-MM-DD.
+- * @param {Date} date
++ * @param {Date} date read in UTC, so the result does not depend on the
++ *   machine's time zone.
+  * @returns {string}
+  */
+ export function formatDate(date) {
+   const year = date.getUTCFullYear();
+   const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+   const day = String(date.getUTCDate()).padStart(2, "0");
+   return `${year}-${month}-${day}`;
+ }

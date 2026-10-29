@@ -1,0 +1,17 @@
+{
+  "name": "claude-cloud-env-tooling",
+  "version": "0.1.0",
+  "private": true,
+  "description": "eco-worker and diff-review: run Claude Code jobs on a cheaper model, and get a second reader for a diff.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "self-test": "node diff-review/diff-review.mjs --self-test"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.11"
+  }
+}

@@ -1,0 +1,20 @@
+diff --git a/src/fetch-user.js b/src/fetch-user.js
+new file mode 100644
+index 0000000..3b1f2c4
+--- /dev/null
++++ b/src/fetch-user.js
+@@ -0,0 +1,14 @@
++/**
++ * Load a user profile from the accounts API.
++ * @param {string} id
++ */
++export async function fetchUser(id) {
++  try {
++    const response = await fetch(`https://accounts.example.com/users/${id}`);
++    const body = await response.json();
++    return body.user ?? { name: "Unknown" };
++  } catch (error) {
++    // TODO: handle errors properly later
++    return { name: "Unknown" };
++  }
++}
