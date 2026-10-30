@@ -9,16 +9,19 @@ Files: `diff-review/diff-review-lib.mjs`, `diff-review/diff-review.mjs`,
 
 ## npm test
 
-Run with the project suite only (a temporary `.work/old-tooling` worktree used
-for the C1 old-code proof is still on disk; plain `npm test` also passes but
-also discovers that worktree's duplicated tests, 127 passed):
+`npm test` at code commit `eb1d142` (before the temporary `.work/old-tooling`
+worktree used for the C1 proof existed):
 
 ```
-$ npx vitest run --exclude '.work/**' --exclude 'node_modules/**'
+$ npm test
 
  Test Files  3 passed (3)
       Tests  72 passed (72)
 ```
+
+In the current checkout that leftover worktree makes plain `npm test` also
+discover its duplicated test files (127 passed); `.work/` is gitignored and not
+in the commit, so a fresh checkout runs the 72-test suite.
 
 New coverage:
 
