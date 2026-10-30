@@ -67,7 +67,8 @@
       "Bash(date:*)",
       "Bash(sha256sum:*)",
       "Bash(tee:*)",
-      "Bash(mktemp:*)"
+      "Bash(mktemp:*)",
+      "Bash(eco-web:*)"
     ],
     "deny": [
       "Bash(git push:*)",

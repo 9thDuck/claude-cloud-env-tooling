@@ -177,11 +177,11 @@ xa="$(printf '%s\n' "${extra[@]}" | jq -R 'select(length>0)' | jq -s .)"
 jq --argjson xa "$xa" '.permissions.allow += $xa' "$perms" > "$cfg/permissions.json" || { echo "eco-worker: FAILED cannot build $cfg/permissions.json" | tee -a "$log" >&2; exit 2; }
 gsrc0="$(guard src)"; guard0="$(guard)"  # after $cfg is built, so the leg's own -a rules are the baseline
 if [ -n "$resume" ]; then
-  task="ANSWERS from the caller to your questions or plan. Apply them, continue the task, and finish under the same WORKER RULES. Do not ask again; if something is still unclear take the safer reading and list it under 'Assumed' in $progress using the Edit or Write tool. A refused command is final for this run: do not retry it or rephrase it (another path, bash -c, a copy in /tmp); carry on with what you can and name it under 'Blocked' in $progress. The caller sees every refusal.
+  task="ANSWERS from the caller to your questions or plan. Apply them, continue the task, and finish under the same WORKER RULES. Do not ask again; if something is still unclear take the safer reading and list it under 'Assumed' in $progress using the Edit or Write tool. A refused command is final for this run: do not retry it or rephrase it (another path, bash -c, a copy in /tmp); carry on with what you can and name it under 'Blocked' in $progress. The caller sees every refusal. For the web use Bash \`eco-web search \"query\"\` and \`eco-web fetch URL\` (WebSearch and WebFetch do not work on this endpoint).
 
 $task"
 else
-  task="WORKER RULES: ~$((timeout_s/60)) min, may be killed. After every step append one line to $progress using the Edit or Write tool. Never push. A refused command is final for this run: do not retry it or rephrase it (another path, bash -c, a copy in /tmp); carry on with what you can and name it under 'Blocked' in $progress. The caller sees every refusal. Stop when the outcome is met; list extras instead of doing them.
+  task="WORKER RULES: ~$((timeout_s/60)) min, may be killed. After every step append one line to $progress using the Edit or Write tool. Never push. A refused command is final for this run: do not retry it or rephrase it (another path, bash -c, a copy in /tmp); carry on with what you can and name it under 'Blocked' in $progress. The caller sees every refusal. For the web use Bash \`eco-web search \"query\"\` and \`eco-web fetch URL\` (WebSearch and WebFetch do not work on this endpoint). Stop when the outcome is met; list extras instead of doing them.
 ASKING: never guess on a point that changes acceptance or where you see two readings. Write at most 3 questions, each with the reading you would take and why, to $qfile and stop immediately; the caller answers and resumes you. If the task touches more than one file, first write a plan of at most 15 lines (files, the existing code you will copy from, tests you will add) to $pfile and stop before any code change. One plan stop and one question stop per task at most; if nothing is in doubt, write neither file.
 
 $task"
@@ -190,12 +190,15 @@ echo "eco-worker: model=$model run=$run log=$log${sid:+ resume=$sid}"; echo "run
 cd "$workdir" || { echo "eco-worker: FAILED cannot cd to $workdir" | tee -a "$log" >&2; exit 2; }
 # Installed after the last pre-flight exit, so a pre-flight failure never writes a RESULT line for a leg that never ran.
 trap 'finish' EXIT
-envargs=(PATH="$PATH" HOME="$HOME")
+envargs=(PATH="$(dirname "$(readlink -f "$0")"):$PATH" HOME="$HOME")
 for v in HTTPS_PROXY HTTP_PROXY NO_PROXY https_proxy http_proxy no_proxy SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS NODE_OPTIONS \
          REQUESTS_CA_BUNDLE CURL_CA_BUNDLE GIT_SSL_CAINFO LANG LC_ALL TERM TMPDIR USER SHELL \
          NODE_PATH PLAYWRIGHT_BROWSERS_PATH PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD GH_NO_UPDATE_NOTIFIER ${fwd[@]+"${fwd[@]}"}; do
   [ -n "${!v:-}" ] && envargs+=("$v=${!v}")
 done
+# eco-web lives next to this script and needs the same key; env -i would otherwise leave it without either.
+envargs+=(ECO_WORKER_API_KEY="$ECO_WORKER_API_KEY")
+[ -n "${ECO_WORKER_SEARCH_URL:-}" ] && envargs+=("ECO_WORKER_SEARCH_URL=$ECO_WORKER_SEARCH_URL")
 # A push the worker starts goes to a URL that cannot exist, unless a child process rewrites its own environment.
 envargs+=(ECO_WORKER=1 ECO_WORKER_HOOK_LOG="$hlog" GIT_CONFIG_COUNT=5 GIT_CONFIG_KEY_0=url.eco-worker-no-push:/.pushInsteadOf GIT_CONFIG_VALUE_0=https://
           GIT_CONFIG_KEY_1=url.eco-worker-no-push:/.pushInsteadOf GIT_CONFIG_VALUE_1=http://

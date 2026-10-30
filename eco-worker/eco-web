@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# eco-web: the only web access an eco-worker has. WebSearch and WebFetch are Anthropic server tools that the
+# cheaper endpoint ignores or rejects, so the worker must use this script instead. Every failure is loud.
+# Usage: eco-web search "<query>" [n]   POST the search API; print up to n (default 8) results
+#        eco-web fetch <url>            download a page and print its text (max 20000 chars)
+#        eco-web --probe-web            one live search and one live fetch, PASS/FAILED per check
+set -euo pipefail
+
+search_url="${ECO_WORKER_SEARCH_URL:-https://api.synthetic.new/v2/search}"
+
+fail() { echo "eco-web: FAILED $*" >&2; exit 1; }
+
+tmp=""; tmp2=""
+trap 'if [ -n "$tmp" ]; then rm -f "$tmp"; fi; if [ -n "$tmp2" ]; then rm -f "$tmp2"; fi' EXIT
+
+# Strip HTML to plain text: drop script/style blocks, drop tags and common entities, squeeze spaces,
+# collapse repeated blank lines.
+html_to_text() {
+  sed -e '/<script[^>]*>/,/<\/script>/d' \
+      -e '/<style[^>]*>/,/<\/style>/d' \
+      -e 's/<[^>]*>//g' \
+      -e 's/&nbsp;/ /g' \
+      -e 's/&amp;/\&/g' \
+      -e 's/&lt;/</g' \
+      -e 's/&gt;/>/g' \
+      -e 's/&quot;/"/g' \
+      -e "s/&#39;/'/g" \
+      -e 's/[[:space:]]\+/ /g' \
+      -e 's/^ //' \
+      -e 's/ $//' \
+    | sed -e '/^$/{N;/^\n$/D}'
+}
+
+cmd_search() {
+  local query="${1:-}" n="${2:-8}" key="${ECO_WORKER_API_KEY:-}" code count
+  [ -n "$query" ] || fail "search needs a query"
+  [ -n "$key" ] || fail "ECO_WORKER_API_KEY not set"
+  case "$n" in ''|*[!0-9]*|0) fail "result count '$n' is not a positive whole number" ;; esac
+  tmp="$(mktemp)"
+  code="$(curl -sS --max-time 30 -o "$tmp" -w '%{http_code}' \
+    -H "Authorization: Bearer $key" \
+    -H "Content-Type: application/json" \
+    --data "$(jq -nc --arg q "$query" '{query:$q}')" \
+    "$search_url")" || fail "search request to $search_url failed"
+  [ "$code" = "200" ] || fail "HTTP $code $search_url $(head -c 300 "$tmp")"
+  if ! count="$(jq -r 'if (.results | type) == "array" then (.results | length) else empty end' "$tmp")"; then
+    fail "response from $search_url is not JSON with a results array"
+  fi
+  [ -n "$count" ] || fail "response from $search_url has no results array"
+  [ "$count" -gt 0 ] || fail "no results for query: $query"
+  jq -r --argjson n "$n" \
+    '.results[:$n][] | "## \(.title // "")\n\(.url // "")\n\((.text // "") | tostring | .[0:600])\n"' "$tmp"
+}
+
+cmd_fetch() {
+  local url="${1:-}" code
+  [ -n "$url" ] || fail "fetch needs a URL"
+  tmp="$(mktemp)"
+  code="$(curl -sSL --max-time 30 --fail-with-body -o "$tmp" -w '%{http_code}' "$url")" \
+    || fail "HTTP ${code:-?} $url $(head -c 300 "$tmp")"
+  [ "$code" = "200" ] || fail "HTTP $code $url $(head -c 300 "$tmp")"
+  # Write the text to a second file first: piping into head would give sed SIGPIPE and pipefail would fail a good fetch.
+  tmp2="$(mktemp)"
+  html_to_text < "$tmp" > "$tmp2"
+  head -c 20000 "$tmp2"
+  echo
+}
+
+cmd_probe_web() {
+  local out rc=0
+  if out="$(cmd_search "astro web framework" 1 2>&1)"; then
+    echo "PASS eco-web search"
+  else
+    echo "FAILED eco-web search: $out" >&2
+    rc=1
+  fi
+  if out="$(cmd_fetch "https://example.com" 2>&1)"; then
+    echo "PASS eco-web fetch"
+  else
+    echo "FAILED eco-web fetch: $out" >&2
+    rc=1
+  fi
+  return "$rc"
+}
+
+case "${1:-}" in
+  search) shift; cmd_search "${1:-}" "${2:-8}" ;;
+  fetch)  shift; cmd_fetch "${1:-}" ;;
+  --probe-web) cmd_probe_web ;;
+  *) echo "usage: eco-web search \"query\" [n] | eco-web fetch <url> | eco-web --probe-web" >&2; exit 2 ;;
+esac

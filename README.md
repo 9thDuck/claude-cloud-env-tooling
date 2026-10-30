@@ -49,6 +49,10 @@ eco-worker: RESULT=<ok|blocked|error|timeout|killed|no-result|plan-skipped> exit
 
 The exit code is 0 only when `RESULT=ok`. When a run needs a command that its permission list does not allow, it stops with `RESULT=blocked`, and `<logdir>/<run>.blocked.md` names each command it was refused. You can add the rule to the permissions file, or resume the run with `-a "Bash(make:*)"`. When the worker is unsure about the task, it writes up to three questions and stops. When the task touches more than one file, it writes a short plan first and stops. To continue in either case, answer with `-r <run>`.
 
+The worker reaches the web only through `eco-web`: `eco-web search "query" [n]` prints up to n results with a snippet, and `eco-web fetch <url>` prints a page's text (20000 chars at most).
+Both print `eco-web: FAILED <reason>` and exit non-zero when anything goes wrong, including a search that returns zero results.
+`WebSearch` and `WebFetch` stay enabled (unchanged behaviour) but do not work here: they are Anthropic server tools that this endpoint ignores (empty search, run still reports ok) or rejects (WebFetch 400). Use eco-web instead. `eco-web --probe-web` runs one live search and one live fetch and reports PASS or FAILED for each.
+
 ### Safety
 
 The worker runs with an allow list and a deny list (`eco-worker/permissions.json`), plus a hook that refuses destructive git and `rm` flags anywhere in a command. Its own git pushes go to an address that does not exist. It does not receive `GH_TOKEN` or most of your environment.
