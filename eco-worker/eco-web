@@ -13,22 +13,25 @@ fail() { echo "eco-web: FAILED $*" >&2; exit 1; }
 tmp=""; tmp2=""
 trap 'if [ -n "$tmp" ]; then rm -f "$tmp"; fi; if [ -n "$tmp2" ]; then rm -f "$tmp2"; fi' EXIT
 
-# Strip HTML to plain text: drop script/style blocks, drop tags and common entities, squeeze spaces,
-# collapse repeated blank lines.
+# Strip HTML to plain text: drop script/style blocks, drop tags and common entities, squeeze spaces.
+# perl -0777 reads the whole page at once, so non-greedy matches also work on one-line/minified HTML
+# where a line-range sed would swallow the rest of the page.
 html_to_text() {
-  sed -e '/<script[^>]*>/,/<\/script>/d' \
-      -e '/<style[^>]*>/,/<\/style>/d' \
-      -e 's/<[^>]*>//g' \
-      -e 's/&nbsp;/ /g' \
-      -e 's/&amp;/\&/g' \
-      -e 's/&lt;/</g' \
-      -e 's/&gt;/>/g' \
-      -e 's/&quot;/"/g' \
-      -e "s/&#39;/'/g" \
-      -e 's/[[:space:]]\+/ /g' \
-      -e 's/^ //' \
-      -e 's/ $//' \
-    | sed -e '/^$/{N;/^\n$/D}'
+  perl -0777 -pe '
+    s{<script\b[^>]*>.*?</script\s*>}{ }gsi;
+    s{<style\b[^>]*>.*?</style\s*>}{ }gsi;
+    s{<!--.*?-->}{ }gs;
+    s{<[^>]*>}{ }gs;
+    s{&nbsp;}{ }g;
+    s{&amp;}{&}g;
+    s{&lt;}{<}g;
+    s{&gt;}{>}g;
+    s{&quot;}{"}g;
+    s{&#39;}{\x27}g;
+    s{\s+}{ }g;
+    s{\A\s+}{};
+    s{\s+\z}{};
+  '
 }
 
 cmd_search() {
@@ -37,11 +40,15 @@ cmd_search() {
   [ -n "$key" ] || fail "ECO_WORKER_API_KEY not set"
   case "$n" in ''|*[!0-9]*|0) fail "result count '$n' is not a positive whole number" ;; esac
   tmp="$(mktemp)"
-  code="$(curl -sS --max-time 30 -o "$tmp" -w '%{http_code}' \
-    -H "Authorization: Bearer $key" \
-    -H "Content-Type: application/json" \
-    --data "$(jq -nc --arg q "$query" '{query:$q}')" \
-    "$search_url")" || fail "search request to $search_url failed"
+  # The key goes through curl's config on stdin (-K -), never in argv, so `ps` cannot show it.
+  # Backslash and double quote are the only characters curl's config parser treats specially.
+  local hdr="${key//\\/\\\\}"
+  hdr="${hdr//\"/\\\"}"
+  code="$(printf 'header = "Authorization: Bearer %s"\n' "$hdr" \
+    | curl -sS --max-time 30 -K - -o "$tmp" -w '%{http_code}' \
+      -H "Content-Type: application/json" \
+      --data "$(jq -nc --arg q "$query" '{query:$q}')" \
+      "$search_url")" || fail "search request to $search_url failed"
   [ "$code" = "200" ] || fail "HTTP $code $search_url $(head -c 300 "$tmp")"
   if ! count="$(jq -r 'if (.results | type) == "array" then (.results | length) else empty end' "$tmp")"; then
     fail "response from $search_url is not JSON with a results array"
@@ -59,9 +66,13 @@ cmd_fetch() {
   code="$(curl -sSL --max-time 30 --fail-with-body -o "$tmp" -w '%{http_code}' "$url")" \
     || fail "HTTP ${code:-?} $url $(head -c 300 "$tmp")"
   [ "$code" = "200" ] || fail "HTTP $code $url $(head -c 300 "$tmp")"
-  # Write the text to a second file first: piping into head would give sed SIGPIPE and pipefail would fail a good fetch.
+  # Write the text to a second file first: piping into head would give the stripper SIGPIPE and pipefail would fail a good fetch.
   tmp2="$(mktemp)"
   html_to_text < "$tmp" > "$tmp2"
+  # A page that came back with bytes but stripped to nothing would be a silent empty answer, so fail loudly.
+  if [ -s "$tmp" ] && ! grep -q '[^[:space:]]' "$tmp2"; then
+    fail "empty text after stripping $url"
+  fi
   head -c 20000 "$tmp2"
   echo
 }

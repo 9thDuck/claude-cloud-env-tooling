@@ -50,6 +50,16 @@ async function searchServer(payload) {
   return { server, url: `http://127.0.0.1:${server.address().port}/v2/search` };
 }
 
+/** Serve one canned HTTP response and return its URL, for fetch tests. */
+async function pageServer({ status = 200, body = "", contentType = "text/html; charset=utf-8" } = {}) {
+  const server = createServer((req, res) => {
+    res.writeHead(status, { "content-type": contentType });
+    res.end(body);
+  });
+  await new Promise((done) => server.listen(0, "127.0.0.1", done));
+  return { server, url: `http://127.0.0.1:${server.address().port}/page` };
+}
+
 /** Run eco-web asynchronously so a local server in this process can answer it. */
 function runEcoWeb(args, env) {
   return new Promise((done) => {
@@ -100,6 +110,57 @@ describe("eco-web", () => {
       expect(result.status, `stdout=${result.stdout} stderr=${result.stderr}`).toBe(0);
       expect(result.stdout).toContain("Astro");
       expect(result.stdout).toContain("https://astro.build/");
+    } finally {
+      server.close();
+    }
+  });
+
+  it("fails when search gets a non-JSON reply", async () => {
+    const { server, url } = await pageServer({ body: "search backend is down", contentType: "text/plain" });
+    try {
+      const result = await runEcoWeb(["search", "astro"], {
+        ...process.env,
+        ECO_WORKER_API_KEY: "test-key",
+        ECO_WORKER_SEARCH_URL: url,
+      });
+      expect(result.status, `stdout=${result.stdout} stderr=${result.stderr}`).toBe(1);
+      expect(result.stderr).toContain("eco-web: FAILED");
+    } finally {
+      server.close();
+    }
+  });
+
+  it("prints body text from a one-line page with inline script and style", async () => {
+    const { server, url } = await pageServer({
+      body: '<html><head><style>.a{color:red}</style><script>var a=1</script></head><body><p>hello buyer</p></body></html>',
+    });
+    try {
+      const result = await runEcoWeb(["fetch", url], { ...process.env });
+      expect(result.status, `stdout=${result.stdout} stderr=${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("hello buyer");
+    } finally {
+      server.close();
+    }
+  });
+
+  it("fails when stripping leaves no text", async () => {
+    const { server, url } = await pageServer({ body: "<html><head><script>var a=1</script></head></html>" });
+    try {
+      const result = await runEcoWeb(["fetch", url], { ...process.env });
+      expect(result.status, `stdout=${result.stdout} stderr=${result.stderr}`).toBe(1);
+      expect(result.stderr).toContain("eco-web: FAILED empty text after stripping");
+    } finally {
+      server.close();
+    }
+  });
+
+  it("fails on a 404 instead of printing the error page", async () => {
+    const { server, url } = await pageServer({ status: 404, body: "<html><body>not found</body></html>" });
+    try {
+      const result = await runEcoWeb(["fetch", url], { ...process.env });
+      expect(result.status, `stdout=${result.stdout} stderr=${result.stderr}`).toBe(1);
+      expect(result.stderr).toContain("eco-web: FAILED");
+      expect(result.stderr).toContain("HTTP 404");
     } finally {
       server.close();
     }

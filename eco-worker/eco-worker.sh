@@ -190,7 +190,7 @@ echo "eco-worker: model=$model run=$run log=$log${sid:+ resume=$sid}"; echo "run
 cd "$workdir" || { echo "eco-worker: FAILED cannot cd to $workdir" | tee -a "$log" >&2; exit 2; }
 # Installed after the last pre-flight exit, so a pre-flight failure never writes a RESULT line for a leg that never ran.
 trap 'finish' EXIT
-envargs=(PATH="$(dirname "$(readlink -f "$0")"):$PATH" HOME="$HOME")
+envargs=(PATH="$PATH:$(dirname "$(readlink -f "$0")")" HOME="$HOME")
 for v in HTTPS_PROXY HTTP_PROXY NO_PROXY https_proxy http_proxy no_proxy SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS NODE_OPTIONS \
          REQUESTS_CA_BUNDLE CURL_CA_BUNDLE GIT_SSL_CAINFO LANG LC_ALL TERM TMPDIR USER SHELL \
          NODE_PATH PLAYWRIGHT_BROWSERS_PATH PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD GH_NO_UPDATE_NOTIFIER ${fwd[@]+"${fwd[@]}"}; do
