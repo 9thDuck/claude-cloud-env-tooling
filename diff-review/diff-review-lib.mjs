@@ -53,6 +53,48 @@ export function workerTimeoutSeconds(chars, env = process.env) {
   );
 }
 
+/** Chunk workers in flight when DIFF_REVIEW_CONCURRENCY is not set. */
+export const DEFAULT_CONCURRENCY = 4;
+
+/**
+ * How many chunk workers may run at once. An integer DIFF_REVIEW_CONCURRENCY
+ * wins, clamped to at least 1; anything that is not a number falls back to the
+ * default.
+ * @param {Record<string, string | undefined>} env
+ * @returns {number}
+ */
+export function concurrencyFromEnv(env = process.env) {
+  const raw = env.DIFF_REVIEW_CONCURRENCY;
+  if (typeof raw === "string" && /^-?\d+$/.test(raw)) return Math.max(1, Number(raw));
+  return DEFAULT_CONCURRENCY;
+}
+
+/**
+ * Run `fn` over `items` with at most `limit` calls in flight. Results keep the
+ * input order no matter which call finishes first. A throwing `fn` rejects the
+ * whole pool; calls already started finish, but their results are ignored.
+ * @template T, R
+ * @param {T[]} items
+ * @param {number} limit
+ * @param {(item: T, index: number) => Promise<R>} fn
+ * @returns {Promise<R[]>}
+ */
+export async function runPool(items, limit, fn) {
+  const list = Array.isArray(items) ? items : [];
+  const width = Math.max(1, Math.floor(Number(limit)) || 1);
+  const results = new Array(list.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < list.length) {
+      const index = next;
+      next += 1;
+      results[index] = await fn(list[index], index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(width, list.length) }, worker));
+  return results;
+}
+
 /** The per-repo config file, read from the merge-base commit. */
 export const CONFIG_FILE = ".diff-review.json";
 

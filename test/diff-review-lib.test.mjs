@@ -4,6 +4,7 @@ import {
   DIFF_REVIEW_CHUNK_CHARS,
   blockingFromEnv,
   buildPrompt,
+  concurrencyFromEnv,
   coverageProblems,
   decide,
   fileRank,
@@ -12,6 +13,7 @@ import {
   parseConfig,
   parseVerdict,
   ruleCopies,
+  runPool,
   runsToPrune,
   splitDiff,
   splitFileSections,
@@ -365,5 +367,69 @@ describe("parseConfig", () => {
     ["a bad decided path", '{"rules":["r.md"],"decided":"../d.md"}'],
   ])("rejects %s", (_name, text) => {
     expect(parseConfig(text).ok).toBe(false);
+  });
+});
+
+describe("runPool", () => {
+  it("runs at most n at a time and returns results in input order", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    // Finish times are deliberately out of order: a later item finishes first.
+    const items = [40, 5, 30, 1, 20, 10];
+    const results = await runPool(items, 2, async (ms, index) => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      inFlight -= 1;
+      return `item-${index}`;
+    });
+    expect(peak).toBe(2);
+    expect(results).toEqual(items.map((_ms, index) => `item-${index}`));
+  });
+
+  it("never runs more than one when the limit is 1 or below", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const items = [3, 1, 2];
+    const results = await runPool(items, 0, async (ms, index) => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      inFlight -= 1;
+      return index;
+    });
+    expect(peak).toBe(1);
+    expect(results).toEqual([0, 1, 2]);
+  });
+
+  it("runs everything at once when the limit exceeds the item count", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const results = await runPool([5, 5, 5], 10, async (ms) => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      inFlight -= 1;
+      return "done";
+    });
+    expect(peak).toBe(3);
+    expect(results).toEqual(["done", "done", "done"]);
+  });
+
+  it("returns an empty list for no items", async () => {
+    expect(await runPool([], 4, async () => "never")).toEqual([]);
+  });
+});
+
+describe("concurrencyFromEnv", () => {
+  it("defaults to 4 and never goes below 1", () => {
+    expect(concurrencyFromEnv({})).toBe(4);
+    expect(concurrencyFromEnv({ DIFF_REVIEW_CONCURRENCY: "6" })).toBe(6);
+    expect(concurrencyFromEnv({ DIFF_REVIEW_CONCURRENCY: "0" })).toBe(1);
+    expect(concurrencyFromEnv({ DIFF_REVIEW_CONCURRENCY: "-2" })).toBe(1);
+  });
+
+  it("falls back to the default for a non-numeric value", () => {
+    expect(concurrencyFromEnv({ DIFF_REVIEW_CONCURRENCY: "many" })).toBe(4);
   });
 });

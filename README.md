@@ -81,7 +81,7 @@ git ignores that folder, and only the newest 20 runs are kept.
 | FAIL (findings printed) | 0 | 1 |
 | ERROR (no valid verdict, worker failed, setup failed) | 1 | 1 |
 
-A diff larger than `DIFF_REVIEW_CHUNK_CHARS` (60,000 characters by default) is split into chunks: whole files first, ordered with source and tests before `docs/` and `.beads/`, and a single larger file split by hunk. Each chunk gets its own reviewer run and the verdicts are merged (any error makes the review an ERROR; any finding makes it a FAIL). Every file in the diff must be covered by a chunk, or the review is an ERROR — nothing is silently dropped. The reviewer runs with the repository root as its working directory, so it can read the code and use read-only git commands; its logs and verdict stay in the run directory. Because reading the repository takes time, each run's timeout grows with its chunk: 600 seconds base plus 600 seconds per started 50,000 characters, capped at 3600 seconds.
+A diff larger than `DIFF_REVIEW_CHUNK_CHARS` (60,000 characters by default) is split into chunks: whole files first, ordered with source and tests before `docs/` and `.beads/`, and a single larger file split by hunk. Each chunk gets its own reviewer run, and up to `DIFF_REVIEW_CONCURRENCY` chunks (4 by default, never fewer than 1) run at the same time; the verdicts are merged in chunk order however the workers finish (any error makes the review an ERROR; any finding makes it a FAIL). Every file in the diff must be covered by a chunk, or the review is an ERROR — nothing is silently dropped. The reviewer runs with the repository root as its working directory, so it can read the code and use read-only git commands; its logs and verdict stay in the run directory. Because reading the repository takes time, each run's timeout grows with its chunk: 600 seconds base plus 600 seconds per started 50,000 characters, capped at 3600 seconds.
 
 ### Your own rules
 
@@ -130,6 +130,7 @@ Only `ECO_WORKER_API_KEY` is required. Every other variable has a default.
 | `DIFF_REVIEW_BLOCKING` | (off) | Set it to `1` to make a FAIL exit 1. |
 | `DIFF_REVIEW_WORKER` | the bundled `eco-worker` | The command that runs the review. It is called as `<cmd> -t <seconds> -d <repo root> "<prompt>"` with `ECO_WORKER_LOG_DIR` set to the run (or chunk) directory. |
 | `DIFF_REVIEW_TIMEOUT_SECONDS` | computed from the chunk | A positive integer that overrides the per-chunk worker timeout (formula and 3600s cap). The default is 600s plus 600s per started 50,000 characters, capped at 3600s. |
+| `DIFF_REVIEW_CONCURRENCY` | `4` | How many chunk reviewers run at the same time. Values below 1 are treated as 1; a non-numeric value uses the default. |
 | `INSTALL_BIN_DIR` | `~/.local/bin` | Where `install.sh` puts the links. |
 | `XDG_STATE_HOME` | `~/.local/state` | The self-test record is kept under `diff-review/` here. |
 

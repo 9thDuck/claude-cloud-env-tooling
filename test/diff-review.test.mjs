@@ -223,9 +223,9 @@ describe("review: repo read access and chunking", () => {
     else process.env.DIFF_REVIEW_WORKER = previousWorker;
   });
 
-  it("runs the worker in the repo root so it can read a file outside the diff (C1)", () => {
+  it("runs the worker in the repo root so it can read a file outside the diff (C1)", async () => {
     const repo = makeRepo("c1-");
-    const result = review({
+    const result = await review({
       diff: `${fileSection("src/feature.js")}\n`,
       base: "main",
       rules: defaultRules(),
@@ -246,14 +246,14 @@ describe("review: repo read access and chunking", () => {
     expect(oldWay.status).not.toBe(0);
   });
 
-  it("runs one worker per chunk and lists every chunk and file", () => {
+  it("runs one worker per chunk and lists every chunk and file", async () => {
     const repo = makeRepo("chunks-");
     const diff = [
       fileSection("src/bad.js"),
       fileSection("src/good.js"),
       fileSection("docs/guide.md"),
     ].join("\n");
-    const result = review({
+    const result = await review({
       diff,
       base: "main",
       rules: defaultRules(),
@@ -276,7 +276,7 @@ describe("review: repo read access and chunking", () => {
     expect(markdown).not.toContain("not covered");
   });
 
-  it("gives each worker run a timeout scaled to its chunk size", () => {
+  it("gives each worker run a timeout scaled to its chunk size", async () => {
     const repo = makeRepo("timeout-");
     const workerDir = mkdtempSync(join(WORK, "recording-worker-"));
     extraDirs.push(workerDir);
@@ -289,7 +289,7 @@ describe("review: repo read access and chunking", () => {
     delete process.env.DIFF_REVIEW_TIMEOUT_SECONDS;
     try {
       const diff = [fileSection("src/a.js"), fileSection("src/b.js"), fileSection("src/c.js")].join("\n");
-      const result = review({
+      const result = await review({
         diff,
         base: "main",
         rules: defaultRules(),
@@ -376,10 +376,10 @@ describe("review: a blocked worker (exit 4)", () => {
     return path;
   }
 
-  function runReview(worker) {
+  async function runReview(worker) {
     process.env.DIFF_REVIEW_WORKER = worker;
     const repo = makeRepo("blocked-");
-    return review({
+    return await review({
       diff: `${fileSection("src/bad.js")}\n`,
       base: "main",
       rules: defaultRules(),
@@ -405,8 +405,8 @@ describe("review: a blocked worker (exit 4)", () => {
     else process.env.DIFF_REVIEW_WORKER = previousWorker;
   });
 
-  it("accepts exit 4 when verdict.json is valid and lists the newest refused calls", () => {
-    const result = runReview(script("blocked-ok.sh", BLOCKED_WORKER));
+  it("accepts exit 4 when verdict.json is valid and lists the newest refused calls", async () => {
+    const result = await runReview(script("blocked-ok.sh", BLOCKED_WORKER));
     expect(result.parsed).toMatchObject({ ok: true, verdict: "FAIL" });
     // Accepted on the first run: exit 4 with a verdict is not a failed review.
     expect(attempts(result)).toBe(1);
@@ -419,16 +419,16 @@ describe("review: a blocked worker (exit 4)", () => {
     expect(markdown).not.toContain("old-command");
   });
 
-  it("is an ERROR when exit 4 leaves no verdict, after retrying", () => {
-    const result = runReview(script("blocked-empty.sh", BLOCKED_NO_VERDICT_WORKER));
+  it("is an ERROR when exit 4 leaves no verdict, after retrying", async () => {
+    const result = await runReview(script("blocked-empty.sh", BLOCKED_NO_VERDICT_WORKER));
     expect(result.parsed.ok).toBe(false);
     expect(result.parsed.error).toContain("exited 4 (blocked) twice");
     expect(attempts(result)).toBe(2);
     expect(readFileSync(result.verdictMd, "utf8")).toContain("## ERROR");
   });
 
-  it("is an ERROR on exit 1, after retrying", () => {
-    const result = runReview(script("exit-one.sh", EXIT_ONE_WORKER));
+  it("is an ERROR on exit 1, after retrying", async () => {
+    const result = await runReview(script("exit-one.sh", EXIT_ONE_WORKER));
     expect(result.parsed.ok).toBe(false);
     expect(result.parsed.error).toContain("exited 1 twice");
     expect(attempts(result)).toBe(2);
