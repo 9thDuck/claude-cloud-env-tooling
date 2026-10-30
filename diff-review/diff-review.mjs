@@ -39,7 +39,7 @@ import { fileURLToPath } from "node:url";
 import {
   CONFIG_FILE,
   DECIDED_COPY,
-  MAX_DIFF_CHARS,
+  DIFF_REVIEW_CHUNK_CHARS,
   blockingFromEnv,
   buildPrompt,
   coverageProblems,
@@ -50,15 +50,15 @@ import {
   ruleCopies,
   runsToPrune,
   splitDiff,
+  workerTimeoutSeconds,
 } from "./diff-review-lib.mjs";
 
 const TOOL_DIR = dirname(fileURLToPath(import.meta.url));
 export const FIXTURES = join(TOOL_DIR, "fixtures");
 export const FIXTURE_FILES = ["bad.patch", "good.patch"];
 export const DEFAULT_RULES = join(TOOL_DIR, "rules", "default-rules.md");
-// A lockfile regen must reach MAX_DIFF_CHARS, not die on Node's 1 MiB default.
+// A lockfile regen must reach the chunk target, not die on Node's 1 MiB default.
 const GIT_MAX_BUFFER = 256 * 1024 * 1024;
-const TIMEOUT_SECONDS = "600";
 
 /**
  * Where the self-test keeps its record and runs; outside any repo, so it works anywhere.
@@ -279,20 +279,21 @@ function refusedCalls(logDir) {
  * was refused. When the leg still wrote a parseable verdict.json the review is
  * usable, so it is accepted without a retry and the refusals are reported.
  * Exit 4 without a valid verdict, and every other non-zero exit, is retried and
- * then reported as an ERROR.
- * @param {{ workdir: string, logDir: string, verdictPath: string, prompt: string }} options
+ * then reported as an ERROR. `timeoutSeconds` scales with the chunk size: the
+ * reviewer reads the repository, so a bigger chunk needs longer.
+ * @param {{ workdir: string, logDir: string, verdictPath: string, prompt: string, timeoutSeconds: number }} options
  * @returns {{ ok: true, blocked: boolean, retried: boolean } | { ok: false, error: string, retried: boolean }}
  */
-function runWorker({ workdir, logDir, verdictPath, prompt }) {
+function runWorker({ workdir, logDir, verdictPath, prompt, timeoutSeconds }) {
   const worker = workerCommand();
   let lastStatus = null;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     // A retry must never read the previous attempt's verdict.
     rmSync(verdictPath, { force: true });
     console.log(
-      `[diff-review] worker attempt ${attempt}/2 (workdir ${workdir}, logs ${logDir})`,
+      `[diff-review] worker attempt ${attempt}/2 (workdir ${workdir}, logs ${logDir}, timeout ${timeoutSeconds}s)`,
     );
-    const result = spawnSync(worker, ["-t", TIMEOUT_SECONDS, "-d", workdir, prompt], {
+    const result = spawnSync(worker, ["-t", String(timeoutSeconds), "-d", workdir, prompt], {
       cwd: workdir,
       encoding: "utf8",
       stdio: "inherit",
@@ -360,11 +361,12 @@ function readChunkVerdict(verdictPath, run, logDir) {
 /**
  * Review one diff and leave the evidence on disk.
  *
- * A diff over MAX_DIFF_CHARS is split into chunks (splitDiff); each chunk gets
- * its own worker run in `<run>/chunks/<n>/`, with the repository root as the
- * worker's working directory so it can read the code the diff talks about. The
- * verdicts are merged (any chunk ERROR => ERROR, else any FAIL => FAIL), and a
- * chunk set that does not cover every file in the diff is an ERROR.
+ * A diff over DIFF_REVIEW_CHUNK_CHARS is split into chunks (splitDiff); each
+ * chunk gets its own worker run in `<run>/chunks/<n>/`, with the repository root
+ * as the worker's working directory so it can read the code the diff talks
+ * about. Each run's timeout scales with its chunk size (workerTimeoutSeconds).
+ * The verdicts are merged (any chunk ERROR => ERROR, else any FAIL => FAIL), and
+ * a chunk set that does not cover every file in the diff is an ERROR.
  * @param {{ diff: string, base: string, rules: ReturnType<typeof loadRules>, outDir: string, label?: string, blocking: boolean, workdir?: string, maxChars?: number }} options
  *   `outDir` holds one directory per run; the oldest are pruned. `workdir` is
  *   the repository root (defaults to `outDir` for the self-test).
@@ -378,7 +380,7 @@ export function review({
   label = "",
   blocking,
   workdir = null,
-  maxChars = MAX_DIFF_CHARS,
+  maxChars = DIFF_REVIEW_CHUNK_CHARS,
 }) {
   const runsDir = resolve(outDir);
   mkdirSync(runsDir, { recursive: true });
@@ -460,6 +462,7 @@ export function review({
         logDir: row.dir,
         verdictPath,
         prompt,
+        timeoutSeconds: workerTimeoutSeconds(row.chars),
       });
       const verdict = readChunkVerdict(verdictPath, run, row.dir);
       row.parsed = verdict.parsed;

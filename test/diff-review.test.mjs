@@ -12,6 +12,7 @@ import {
 import { join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { workerTimeoutSeconds } from "../diff-review/diff-review-lib.mjs";
 import {
   FIXTURES,
   collectDiff,
@@ -73,6 +74,14 @@ if printf '%s' "$prompt" | grep -q 'src/bad.js'; then
 else
   printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
 fi
+`;
+
+// Records the -t value it was called with, next to a valid verdict.
+const RECORDING_WORKER = `#!/usr/bin/env bash
+set -euo pipefail
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf '%s\\n' "$2" > "$out/timeout.txt"
+printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
 `;
 
 beforeAll(() => {
@@ -265,6 +274,47 @@ describe("review: repo read access and chunking", () => {
     for (const file of ["src/bad.js", "src/good.js", "docs/guide.md"])
       expect(markdown).toContain(file);
     expect(markdown).not.toContain("not covered");
+  });
+
+  it("gives each worker run a timeout scaled to its chunk size", () => {
+    const repo = makeRepo("timeout-");
+    const workerDir = mkdtempSync(join(WORK, "recording-worker-"));
+    extraDirs.push(workerDir);
+    const worker = join(workerDir, "recording-worker.sh");
+    writeFileSync(worker, RECORDING_WORKER);
+    chmodSync(worker, 0o755);
+    const previousWorker = process.env.DIFF_REVIEW_WORKER;
+    const previousTimeout = process.env.DIFF_REVIEW_TIMEOUT_SECONDS;
+    process.env.DIFF_REVIEW_WORKER = worker;
+    delete process.env.DIFF_REVIEW_TIMEOUT_SECONDS;
+    try {
+      const diff = [fileSection("src/a.js"), fileSection("src/b.js"), fileSection("src/c.js")].join("\n");
+      const result = review({
+        diff,
+        base: "main",
+        rules: defaultRules(),
+        outDir: join(repo, ".diff-review"),
+        blocking: false,
+        workdir: repo,
+        maxChars: 150,
+      });
+      expect(result.parsed).toMatchObject({ ok: true, verdict: "PASS" });
+      const chunkDirs = readdirSync(join(result.dir, "chunks"));
+      expect(chunkDirs.length).toBeGreaterThan(1);
+      for (const name of chunkDirs) {
+        const chunkDir = join(result.dir, "chunks", name);
+        const chars = readFileSync(join(chunkDir, "diff.patch"), "utf8").length;
+        // The old fixed -t 600 is now too short even for a small chunk.
+        expect(Number(readFileSync(join(chunkDir, "timeout.txt"), "utf8").trim())).toBe(
+          workerTimeoutSeconds(chars),
+        );
+      }
+    } finally {
+      if (previousWorker === undefined) delete process.env.DIFF_REVIEW_WORKER;
+      else process.env.DIFF_REVIEW_WORKER = previousWorker;
+      if (previousTimeout === undefined) delete process.env.DIFF_REVIEW_TIMEOUT_SECONDS;
+      else process.env.DIFF_REVIEW_TIMEOUT_SECONDS = previousTimeout;
+    }
   });
 
   it("finishes a --diff-file review with the repo as the worker cwd", () => {

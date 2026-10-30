@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  DIFF_REVIEW_CHUNK_CHARS,
   blockingFromEnv,
   buildPrompt,
   coverageProblems,
@@ -14,6 +15,7 @@ import {
   runsToPrune,
   splitDiff,
   splitFileSections,
+  workerTimeoutSeconds,
 } from "../diff-review/diff-review-lib.mjs";
 
 const finding = { file: "src/a.js", line: 3, rule: '"No secrets" (rules.md)', why: "adds a key" };
@@ -244,6 +246,48 @@ describe("splitDiff", () => {
     expect(coverageProblems("not a diff\n", splitDiff("not a diff\n").chunks)).toEqual([
       "the diff has no recognizable file headers, so file coverage cannot be verified",
     ]);
+  });
+});
+
+describe("DIFF_REVIEW_CHUNK_CHARS", () => {
+  it("defaults review chunks to 60,000 characters, below the old 200,000 limit", () => {
+    expect(DIFF_REVIEW_CHUNK_CHARS).toBe(60000);
+    // Three ~24k files: 72k total, so one chunk under the old 200k default and
+    // two chunks under the review target. The worker timeout grows with a chunk.
+    const big = () => `@@ -1 +1 @@\n-${"x".repeat(24000)}\n+${"y".repeat(24000)}`;
+    const diff = ["src/a.js", "src/b.js", "src/c.js"].map((path) => fileSection(path, [big()])).join("\n");
+    expect(diff.length).toBeGreaterThan(DIFF_REVIEW_CHUNK_CHARS);
+    expect(diff.length).toBeLessThan(200000);
+    const split = splitDiff(diff);
+    expect(split.chunks.length).toBeGreaterThan(1);
+    for (const chunk of split.chunks)
+      expect(chunk.text.length).toBeLessThanOrEqual(DIFF_REVIEW_CHUNK_CHARS);
+    expect(coverageProblems(diff, split.chunks)).toEqual([]);
+  });
+});
+
+describe("workerTimeoutSeconds", () => {
+  it("scales 600s base by 600s per started 50,000 characters", () => {
+    expect(workerTimeoutSeconds(0, {})).toBe(600);
+    expect(workerTimeoutSeconds(1, {})).toBe(1200);
+    expect(workerTimeoutSeconds(50000, {})).toBe(1200);
+    expect(workerTimeoutSeconds(50001, {})).toBe(1800);
+    expect(workerTimeoutSeconds(200000, {})).toBe(3000);
+  });
+
+  it("caps at 3600s however large the chunk", () => {
+    expect(workerTimeoutSeconds(1000000, {})).toBe(3600);
+  });
+
+  it("lets DIFF_REVIEW_TIMEOUT_SECONDS override the formula and the cap", () => {
+    expect(workerTimeoutSeconds(200000, { DIFF_REVIEW_TIMEOUT_SECONDS: "900" })).toBe(900);
+    expect(workerTimeoutSeconds(1000000, { DIFF_REVIEW_TIMEOUT_SECONDS: "900" })).toBe(900);
+  });
+
+  it("ignores a malformed override instead of passing it to the worker", () => {
+    expect(workerTimeoutSeconds(50001, { DIFF_REVIEW_TIMEOUT_SECONDS: "0" })).toBe(1800);
+    expect(workerTimeoutSeconds(50001, { DIFF_REVIEW_TIMEOUT_SECONDS: "abc" })).toBe(1800);
+    expect(workerTimeoutSeconds(50001, { DIFF_REVIEW_TIMEOUT_SECONDS: "1.5" })).toBe(1800);
   });
 });
 

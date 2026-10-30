@@ -12,11 +12,46 @@
  */
 
 /**
- * Largest chunk (in characters) one reviewer run is asked to read. A bigger
- * diff is split by file (and a bigger file by hunk) so every file is reviewed;
- * see splitDiff. Nothing is truncated.
+ * Largest diff (in characters) this tool was originally willing to hand over in
+ * one piece. Review chunking uses DIFF_REVIEW_CHUNK_CHARS instead; this remains
+ * the ceiling named in decide()'s truncated-diff message. Nothing is truncated.
  */
 export const MAX_DIFF_CHARS = 200000;
+
+/**
+ * Target chunk size (in characters) for one reviewer run. It is deliberately
+ * smaller than MAX_DIFF_CHARS: the reviewer reads the repository to verify the
+ * diff, so its run time grows with the chunk it is given. A bigger diff is split
+ * by file (and a bigger file by hunk) so every file is reviewed; see splitDiff.
+ */
+export const DIFF_REVIEW_CHUNK_CHARS = 60000;
+
+/** Worker timeout: a base plus a step for every WORKER_TIMEOUT_STEP_CHARS. */
+export const WORKER_TIMEOUT_BASE_SECONDS = 600;
+export const WORKER_TIMEOUT_STEP_SECONDS = 600;
+export const WORKER_TIMEOUT_STEP_CHARS = 50000;
+export const WORKER_TIMEOUT_MAX_SECONDS = 3600;
+
+/**
+ * Seconds to give the worker for a chunk of `chars` characters: 600s base plus
+ * 600s per started 50,000 characters, capped at 3600s. A larger chunk is read
+ * with more of the repository, so a fixed timeout would cut it off. An explicit
+ * DIFF_REVIEW_TIMEOUT_SECONDS (a positive integer) wins over both the formula
+ * and the cap.
+ * @param {number} chars chunk size in characters.
+ * @param {Record<string, string | undefined>} env
+ * @returns {number} timeout in seconds.
+ */
+export function workerTimeoutSeconds(chars, env = process.env) {
+  const override = env.DIFF_REVIEW_TIMEOUT_SECONDS;
+  if (typeof override === "string" && /^[1-9]\d*$/.test(override)) return Number(override);
+  const size = Number.isFinite(chars) && chars > 0 ? chars : 0;
+  const steps = Math.ceil(size / WORKER_TIMEOUT_STEP_CHARS);
+  return Math.min(
+    WORKER_TIMEOUT_MAX_SECONDS,
+    WORKER_TIMEOUT_BASE_SECONDS + steps * WORKER_TIMEOUT_STEP_SECONDS,
+  );
+}
 
 /** The per-repo config file, read from the merge-base commit. */
 export const CONFIG_FILE = ".diff-review.json";
@@ -230,13 +265,14 @@ function splitSectionByHunks(section, maxChars) {
 
 /**
  * Split a diff into reviewable chunks, ordered source/tests first and docs and
- * .beads last. Whole files are packed under `maxChars`; a file bigger than that
- * is split by hunk. Every file appears in at least one chunk.
+ * .beads last. Whole files are packed under `maxChars` (default
+ * DIFF_REVIEW_CHUNK_CHARS); a file bigger than that is split by hunk. Every file
+ * appears in at least one chunk.
  * @param {string} diff
  * @param {{ maxChars?: number }} [options]
  * @returns {{ chunks: Array<{ text: string, files: string[], oversize: boolean }>, files: string[] }}
  */
-export function splitDiff(diff, { maxChars = MAX_DIFF_CHARS } = {}) {
+export function splitDiff(diff, { maxChars = DIFF_REVIEW_CHUNK_CHARS } = {}) {
   if (!Number.isInteger(maxChars) || maxChars <= 0)
     throw new Error("maxChars must be a positive integer");
   const sections = splitFileSections(diff)
