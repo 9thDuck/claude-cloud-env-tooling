@@ -286,3 +286,101 @@ describe("review: repo read access and chunking", () => {
     expect(result.stdout).toContain("verdict:");
   });
 });
+
+// eco-worker exits 4 when any optional Bash call was refused, even after the
+// worker wrote a correct verdict.json. These scripts stand in for that leg and
+// append one line per attempt so a test can prove whether runWorker retried.
+const BLOCKED_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf 'x\\n' >> "$out/attempts"
+printf '%s\\n' '{"verdict":"FAIL","findings":[{"file":"src/bad.js","line":1,"rule":"No stubs","why":"planted bad file"}],"untested":[]}' > "$out/verdict.json"
+printf '# Refused tool calls in run old\\n- NOT ALLOWED Bash: old-command\\n' > "$out/old.blocked.md"
+touch -d '2000-01-01' "$out/old.blocked.md"
+printf '# Refused tool calls in run new\\nRules line.\\n- NOT ALLOWED Bash: git log --all\\n- DENIED Bash: gh pr view\\n' > "$out/new.blocked.md"
+touch -d '2020-01-01' "$out/new.blocked.md"
+exit 4
+`;
+
+const BLOCKED_NO_VERDICT_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf 'x\\n' >> "$out/attempts"
+printf '# Refused tool calls\\n- NOT ALLOWED Bash: blocked-cmd\\n' > "$out/run-$RANDOM.blocked.md"
+exit 4
+`;
+
+const EXIT_ONE_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf 'x\\n' >> "$out/attempts"
+printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
+exit 1
+`;
+
+describe("review: a blocked worker (exit 4)", () => {
+  let scriptsDir;
+  let previousWorker;
+
+  function script(name, body) {
+    const path = join(scriptsDir, name);
+    writeFileSync(path, body);
+    chmodSync(path, 0o755);
+    return path;
+  }
+
+  function runReview(worker) {
+    process.env.DIFF_REVIEW_WORKER = worker;
+    const repo = makeRepo("blocked-");
+    return review({
+      diff: `${fileSection("src/bad.js")}\n`,
+      base: "main",
+      rules: defaultRules(),
+      outDir: join(repo, ".diff-review"),
+      blocking: false,
+      workdir: repo,
+    });
+  }
+
+  /** How many times the fake worker ran in this review. */
+  function attempts(result) {
+    return readFileSync(join(result.dir, "attempts"), "utf8").trim().split("\n").length;
+  }
+
+  beforeAll(() => {
+    scriptsDir = mkdtempSync(join(WORK, "blocked-workers-"));
+    extraDirs.push(scriptsDir);
+    previousWorker = process.env.DIFF_REVIEW_WORKER;
+  });
+
+  afterAll(() => {
+    if (previousWorker === undefined) delete process.env.DIFF_REVIEW_WORKER;
+    else process.env.DIFF_REVIEW_WORKER = previousWorker;
+  });
+
+  it("accepts exit 4 when verdict.json is valid and lists the newest refused calls", () => {
+    const result = runReview(script("blocked-ok.sh", BLOCKED_WORKER));
+    expect(result.parsed).toMatchObject({ ok: true, verdict: "FAIL" });
+    // Accepted on the first run: exit 4 with a verdict is not a failed review.
+    expect(attempts(result)).toBe(1);
+    const markdown = readFileSync(result.verdictMd, "utf8");
+    expect(markdown).toContain("exit 4 (blocked): refused calls listed");
+    expect(markdown).toContain("## Untested / refused calls");
+    expect(markdown).toContain("git log --all");
+    expect(markdown).toContain("gh pr view");
+    // Only the newest *.blocked.md is carried.
+    expect(markdown).not.toContain("old-command");
+  });
+
+  it("is an ERROR when exit 4 leaves no verdict, after retrying", () => {
+    const result = runReview(script("blocked-empty.sh", BLOCKED_NO_VERDICT_WORKER));
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toContain("exited 4 (blocked) twice");
+    expect(attempts(result)).toBe(2);
+    expect(readFileSync(result.verdictMd, "utf8")).toContain("## ERROR");
+  });
+
+  it("is an ERROR on exit 1, after retrying", () => {
+    const result = runReview(script("exit-one.sh", EXIT_ONE_WORKER));
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toContain("exited 1 twice");
+    expect(attempts(result)).toBe(2);
+  });
+});
