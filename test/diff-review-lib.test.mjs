@@ -1,17 +1,33 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  MAX_DIFF_CHARS,
   blockingFromEnv,
   buildPrompt,
+  coverageProblems,
   decide,
+  fileRank,
+  filesInDiff,
+  mergeVerdicts,
   parseConfig,
   parseVerdict,
   ruleCopies,
   runsToPrune,
+  splitDiff,
+  splitFileSections,
 } from "../diff-review/diff-review-lib.mjs";
 
 const finding = { file: "src/a.js", line: 3, rule: '"No secrets" (rules.md)', why: "adds a key" };
+
+/** One file's section of a unified diff. */
+function fileSection(path, hunks = ["@@ -1 +1 @@\n-a\n+b"]) {
+  return [
+    `diff --git a/${path} b/${path}`,
+    "index 1111111..2222222 100644",
+    `--- a/${path}`,
+    `+++ b/${path}`,
+    ...hunks,
+  ].join("\n");
+}
 
 describe("parseVerdict", () => {
   it("accepts a PASS with no findings", () => {
@@ -82,19 +98,187 @@ describe("blockingFromEnv", () => {
 });
 
 describe("buildPrompt", () => {
-  it("names each rule copy, the project and a complete diff", () => {
-    const prompt = buildPrompt({ diff: "abc", base: "origin/main", rules: ["docs/a.md", "b.md"], project: "A shop" });
-    expect(prompt).toContain("- ./rules/1-a.md");
-    expect(prompt).toContain("- ./rules/2-b.md");
+  it("names absolute rule paths, the project, the files and the chunk", () => {
+    const prompt = buildPrompt({
+      base: "origin/main",
+      chunk: { text: "abc", files: ["src/a.js", "e2e/a.js"] },
+      chunkIndex: 2,
+      chunkCount: 3,
+      diffPath: "/runs/1/chunks/2/diff.patch",
+      verdictPath: "/runs/1/chunks/2/verdict.json",
+      rulePaths: ["/runs/1/rules/1-a.md", "/runs/1/rules/2-rules.md"],
+      project: "A shop",
+      workdir: "/repo",
+    });
+    expect(prompt).toContain("- /runs/1/rules/1-a.md");
+    expect(prompt).toContain("- /runs/1/rules/2-rules.md");
     expect(prompt).toContain("The project: A shop");
-    expect(prompt).toContain("(3 characters, complete)");
-    expect(prompt).not.toContain("decided.md");
+    expect(prompt).toContain("chunk 2 of 3");
+    expect(prompt).toContain("/runs/1/chunks/2/diff.patch");
+    expect(prompt).toContain("/runs/1/chunks/2/verdict.json");
+    expect(prompt).toContain("Your working directory is /repo");
+    expect(prompt).toContain("- src/a.js");
+    expect(prompt).toContain("- e2e/a.js");
+    expect(prompt).not.toContain("decided");
   });
 
-  it("says when the diff is cut and when a decided file exists", () => {
-    const prompt = buildPrompt({ diff: "x".repeat(MAX_DIFF_CHARS + 1), base: "b", rules: ["r.md"], decided: true });
-    expect(prompt).toContain(`only the first ${MAX_DIFF_CHARS}`);
-    expect(prompt).toContain("./decided.md");
+  it("says a single diff is complete and names the decided file", () => {
+    const prompt = buildPrompt({
+      base: "b",
+      chunk: { text: "x", files: [] },
+      decided: true,
+      decidedPath: "/runs/1/decided.md",
+      rulePaths: ["/runs/1/rules/1-r.md"],
+    });
+    expect(prompt).toContain("(1 characters, complete)");
+    expect(prompt).toContain("/runs/1/decided.md");
+    expect(prompt).toContain("This chunk holds no file body.");
+  });
+});
+
+describe("splitFileSections", () => {
+  it("keeps every byte and names each file", () => {
+    const diff = `${fileSection("src/a.js")}\n${fileSection("docs/b.md")}\n`;
+    const sections = splitFileSections(diff);
+    expect(sections.map((section) => section.path)).toEqual(["src/a.js", "docs/b.md"]);
+    expect(sections.map((section) => section.text).join("\n")).toBe(diff);
+    expect(filesInDiff(diff)).toEqual(["src/a.js", "docs/b.md"]);
+  });
+
+  it("does not mistake a removed line that looks like a header for a new file", () => {
+    const diff = fileSection("src/a.js", ["@@ -1,2 +1,1 @@\n context\n--- not a header"]);
+    expect(filesInDiff(diff)).toEqual(["src/a.js"]);
+  });
+
+  it("names a binary/rename section from the diff --git header", () => {
+    const binary =
+      "diff --git a/assets/logo.png b/assets/logo.png\nindex 1111111..2222222 100644\nBinary files a/assets/logo.png and b/assets/logo.png differ\n";
+    expect(filesInDiff(binary)).toEqual(["assets/logo.png"]);
+    const split = splitDiff(binary);
+    expect(split.chunks[0].files).toEqual(["assets/logo.png"]);
+    expect(coverageProblems(binary, split.chunks)).toEqual([]);
+  });
+});
+
+describe("fileRank", () => {
+  it("puts source and tests first, docs and beads last", () => {
+    expect(fileRank("src/a.js")).toBe(0);
+    expect(fileRank("e2e/flow.js")).toBe(0);
+    expect(fileRank("scripts/build.mjs")).toBe(0);
+    expect(fileRank("config/vite.ts")).toBe(0);
+    expect(fileRank("test/a.test.js")).toBe(0);
+    expect(fileRank("package.json")).toBe(1);
+    expect(fileRank("docs/guide.md")).toBe(2);
+    expect(fileRank(".beads/issue.md")).toBe(2);
+  });
+});
+
+describe("splitDiff", () => {
+  const diff = [
+    fileSection("docs/guide.md"),
+    fileSection("zzz/app.js"),
+    fileSection("src/a.js"),
+    fileSection("e2e/flow.js"),
+    fileSection(".beads/issue.md"),
+    fileSection("package.json"),
+  ].join("\n");
+
+  it("orders source and tests first and docs/.beads last", () => {
+    const split = splitDiff(diff);
+    expect(split.chunks).toHaveLength(1);
+    expect(split.chunks[0].files).toEqual([
+      "e2e/flow.js",
+      "src/a.js",
+      "package.json",
+      "zzz/app.js",
+      ".beads/issue.md",
+      "docs/guide.md",
+    ]);
+    expect([...split.files].sort()).toEqual(
+      ["src/a.js", "e2e/flow.js", ".beads/issue.md", "docs/guide.md", "package.json", "zzz/app.js"].sort(),
+    );
+  });
+
+  it("packs whole files under the limit and covers all of them", () => {
+    const split = splitDiff(diff, { maxChars: 260 });
+    expect(split.chunks.length).toBeGreaterThan(1);
+    for (const chunk of split.chunks) expect(chunk.text.length).toBeLessThanOrEqual(260);
+    expect(coverageProblems(diff, split.chunks)).toEqual([]);
+  });
+
+  it("reports a planted dropped file as a coverage problem", () => {
+    const split = splitDiff(diff, { maxChars: 260 });
+    const planted = split.chunks.map((chunk) => ({
+      ...chunk,
+      files: chunk.files.filter((file) => file !== "src/a.js"),
+    }));
+    expect(coverageProblems(diff, planted)).toContain(
+      "file src/a.js is in the diff but no chunk covers it",
+    );
+  });
+
+  it("reports coverage when a whole chunk is dropped", () => {
+    const split = splitDiff(diff, { maxChars: 260 });
+    const problems = coverageProblems(diff, split.chunks.slice(1));
+    expect(problems.length).toBeGreaterThan(0);
+  });
+
+  it("splits one oversized file by hunk without losing a hunk", () => {
+    const hunks = Array.from(
+      { length: 6 },
+      (_, index) => `@@ -${index * 10 + 1},3 +${index * 10 + 1},3 @@\n context\n-old${index}\n+new${index}`,
+    );
+    const big = fileSection("src/big.js", hunks);
+    const split = splitDiff(big, { maxChars: 230 });
+    expect(split.chunks.length).toBeGreaterThan(1);
+    for (const chunk of split.chunks) {
+      expect(chunk.files).toEqual(["src/big.js"]);
+      expect(chunk.text.startsWith("diff --git a/src/big.js b/src/big.js")).toBe(true);
+    }
+    const combined = split.chunks.map((chunk) => chunk.text).join("\n");
+    for (let index = 0; index < hunks.length; index += 1) expect(combined).toContain(`+new${index}`);
+    expect(coverageProblems(big, split.chunks)).toEqual([]);
+  });
+
+  it("cannot verify coverage when the diff has no file headers", () => {
+    expect(coverageProblems("not a diff\n", splitDiff("not a diff\n").chunks)).toEqual([
+      "the diff has no recognizable file headers, so file coverage cannot be verified",
+    ]);
+  });
+});
+
+describe("mergeVerdicts", () => {
+  const pass = { ok: true, verdict: "PASS", findings: [], untested: [] };
+  const fail = { ok: true, verdict: "FAIL", findings: [finding], untested: ["could not check"] };
+
+  it("passes only when every chunk passes", () => {
+    expect(mergeVerdicts([{ index: 1, parsed: pass }, { index: 2, parsed: pass }])).toEqual({
+      ok: true,
+      verdict: "PASS",
+      findings: [],
+      untested: [],
+    });
+  });
+
+  it("fails when any chunk fails and keeps findings and untested", () => {
+    expect(mergeVerdicts([{ index: 1, parsed: pass }, { index: 2, parsed: fail }])).toEqual({
+      ok: true,
+      verdict: "FAIL",
+      findings: [finding],
+      untested: ["chunk 2: could not check"],
+    });
+  });
+
+  it("is an ERROR when any chunk errored, even if another failed", () => {
+    const error = { ok: false, error: "worker exited 3" };
+    expect(mergeVerdicts([{ index: 1, parsed: fail }, { index: 2, parsed: error }])).toEqual({
+      ok: false,
+      error: "chunk 2: worker exited 3",
+    });
+  });
+
+  it("is an ERROR with no chunk verdicts", () => {
+    expect(mergeVerdicts([]).ok).toBe(false);
   });
 });
 

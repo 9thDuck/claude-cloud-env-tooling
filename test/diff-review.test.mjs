@@ -1,26 +1,79 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
   FIXTURES,
   collectDiff,
+  defaultRules,
   fixtureHashProblems,
   loadRules,
   mergeBaseOf,
   parseArgs,
+  review,
   stateDir,
   workerCommand,
 } from "../diff-review/diff-review.mjs";
 
 const WORK = resolve(import.meta.dirname, "..", ".work");
 let dir;
+const extraDirs = [];
 
 /** Run git in the temp repo. */
 function git(...args) {
   return execFileSync("git", args, { cwd: dir, encoding: "utf8" });
 }
+
+/** A fresh git repo whose committed app.js is NOT in the reviewed diff. */
+function makeRepo(prefix) {
+  const repo = mkdtempSync(join(WORK, prefix));
+  extraDirs.push(repo);
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: repo });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+  execFileSync("git", ["config", "user.name", "test"], { cwd: repo });
+  writeFileSync(join(repo, "app.js"), "export const marker = 'from-repo';\n");
+  execFileSync("git", ["add", "."], { cwd: repo });
+  execFileSync("git", ["commit", "-q", "-m", "base"], { cwd: repo });
+  return repo;
+}
+
+/** One file's section of a unified diff. */
+function fileSection(path, hunks = ["@@ -1 +1 @@\n-a\n+b"]) {
+  return [
+    `diff --git a/${path} b/${path}`,
+    "index 1111111..2222222 100644",
+    `--- a/${path}`,
+    `+++ b/${path}`,
+    ...hunks,
+  ].join("\n");
+}
+
+// Proves where the worker runs: it reads ./app.js, a repo file outside the diff,
+// and writes its verdict to the run directory. The old spawn used the run
+// directory as cwd, where app.js does not exist.
+const FAKE_WORKER = `#!/usr/bin/env bash
+set -euo pipefail
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+for last in "$@"; do :; done
+prompt="$last"
+value="$(cat app.js)"
+printf 'cwd=%s\\nread app.js=%s\\n' "$PWD" "$value" > "$out/c1-read-proof.txt"
+if printf '%s' "$prompt" | grep -q 'src/bad.js'; then
+  printf '%s\\n' '{"verdict":"FAIL","findings":[{"file":"src/bad.js","line":1,"rule":"No stubs","why":"planted bad file"}],"untested":[]}' > "$out/verdict.json"
+else
+  printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
+fi
+`;
 
 beforeAll(() => {
   mkdirSync(WORK, { recursive: true });
@@ -33,7 +86,10 @@ beforeAll(() => {
   git("commit", "-q", "-m", "base");
 });
 
-afterAll(() => rmSync(dir, { recursive: true, force: true }));
+afterAll(() => {
+  rmSync(dir, { recursive: true, force: true });
+  for (const path of extraDirs) rmSync(path, { recursive: true, force: true });
+});
 
 describe("parseArgs", () => {
   it("defaults to a review against origin/main", () => {
@@ -136,5 +192,97 @@ describe("CLI", () => {
     const result = spawnSync("node", [resolve(import.meta.dirname, "..", "diff-review", "diff-review.mjs"), "--nope"], { encoding: "utf8" });
     expect(result.status).toBe(2);
     expect(result.stderr).toContain("usage: diff-review");
+  });
+});
+
+describe("review: repo read access and chunking", () => {
+  let fakeWorker;
+  let previousWorker;
+
+  beforeAll(() => {
+    const fakeDir = mkdtempSync(join(WORK, "fake-worker-"));
+    extraDirs.push(fakeDir);
+    fakeWorker = join(fakeDir, "fake-worker.sh");
+    writeFileSync(fakeWorker, FAKE_WORKER);
+    chmodSync(fakeWorker, 0o755);
+    previousWorker = process.env.DIFF_REVIEW_WORKER;
+    process.env.DIFF_REVIEW_WORKER = fakeWorker;
+  });
+
+  afterAll(() => {
+    if (previousWorker === undefined) delete process.env.DIFF_REVIEW_WORKER;
+    else process.env.DIFF_REVIEW_WORKER = previousWorker;
+  });
+
+  it("runs the worker in the repo root so it can read a file outside the diff (C1)", () => {
+    const repo = makeRepo("c1-");
+    const result = review({
+      diff: `${fileSection("src/feature.js")}\n`,
+      base: "main",
+      rules: defaultRules(),
+      outDir: join(repo, ".diff-review"),
+      blocking: false,
+      workdir: repo,
+    });
+    expect(result.parsed).toMatchObject({ ok: true, verdict: "PASS" });
+    const proof = readFileSync(join(result.dir, "c1-read-proof.txt"), "utf8");
+    expect(proof).toContain(`cwd=${repo}`);
+    expect(proof).toContain("read app.js=export const marker = 'from-repo';");
+    // The old spawn put cwd at the run directory; app.js is not there.
+    const oldWay = spawnSync(fakeWorker, ["-t", "600", "-d", result.dir, "prompt"], {
+      cwd: result.dir,
+      encoding: "utf8",
+      env: { ...process.env, ECO_WORKER_LOG_DIR: result.dir },
+    });
+    expect(oldWay.status).not.toBe(0);
+  });
+
+  it("runs one worker per chunk and lists every chunk and file", () => {
+    const repo = makeRepo("chunks-");
+    const diff = [
+      fileSection("src/bad.js"),
+      fileSection("src/good.js"),
+      fileSection("docs/guide.md"),
+    ].join("\n");
+    const result = review({
+      diff,
+      base: "main",
+      rules: defaultRules(),
+      outDir: join(repo, ".diff-review"),
+      blocking: false,
+      workdir: repo,
+      maxChars: 150,
+    });
+    expect(result.parsed.ok).toBe(true);
+    expect(result.parsed.verdict).toBe("FAIL");
+    expect(result.parsed.findings).toHaveLength(1);
+    expect(result.parsed.findings[0].file).toBe("src/bad.js");
+    const chunkDirs = readdirSync(join(result.dir, "chunks"));
+    expect(chunkDirs.length).toBeGreaterThan(1);
+    const markdown = readFileSync(result.verdictMd, "utf8");
+    expect(markdown).toContain(`- chunks: ${chunkDirs.length}`);
+    expect(markdown).toContain("## Chunks");
+    for (const file of ["src/bad.js", "src/good.js", "docs/guide.md"])
+      expect(markdown).toContain(file);
+    expect(markdown).not.toContain("not covered");
+  });
+
+  it("finishes a --diff-file review with the repo as the worker cwd", () => {
+    const repo = makeRepo("cli-");
+    execFileSync("git", ["branch", "origin/main", "main"], { cwd: repo });
+    writeFileSync(join(repo, "change.patch"), `${fileSection("src/bad.js")}\n`);
+    const result = spawnSync(
+      "node",
+      [resolve(import.meta.dirname, "..", "diff-review", "diff-review.mjs"), "--diff-file", "change.patch"],
+      {
+        cwd: repo,
+        encoding: "utf8",
+        env: { ...process.env, DIFF_REVIEW_WORKER: fakeWorker },
+      },
+    );
+    // Advisory FAIL: the reviewer ran and found something, so exit 0.
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("diff-review: FAIL (advisory) 1 finding");
+    expect(result.stdout).toContain("verdict:");
   });
 });

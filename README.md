@@ -66,11 +66,12 @@ diff-review --diff-file change.patch
 
 Each run writes these files to `<repo>/.diff-review/<timestamp>/`:
 
-- `diff.patch`;
-- `prompt.md`;
+- `diff.patch`, the whole diff;
+- `chunks/<n>/` (when the diff is split): that chunk's `diff.patch`, `prompt.md`, worker logs and `verdict.json`;
+- `prompt.md` (a single-chunk run keeps it here);
 - the rule files;
-- the reviewer's `verdict.json`;
-- `verdict.md`, a readable copy of the verdict.
+- the reviewer's `verdict.json` (a single-chunk run) or each chunk's `verdict.json`;
+- `verdict.md`, a readable copy of the merged verdict that lists every chunk and every file covered.
 
 git ignores that folder, and only the newest 20 runs are kept.
 
@@ -80,7 +81,7 @@ git ignores that folder, and only the newest 20 runs are kept.
 | FAIL (findings printed) | 0 | 1 |
 | ERROR (no valid verdict, worker failed, setup failed) | 1 | 1 |
 
-A diff larger than 200,000 characters is cut to that length before the reviewer sees it. A PASS on a cut diff counts as an ERROR, so split such a change into smaller pieces.
+A diff larger than 200,000 characters is split into chunks: whole files first, ordered with source and tests before `docs/` and `.beads/`, and a single larger file split by hunk. Each chunk gets its own reviewer run and the verdicts are merged (any error makes the review an ERROR; any finding makes it a FAIL). Every file in the diff must be covered by a chunk, or the review is an ERROR — nothing is silently dropped. The reviewer runs with the repository root as its working directory, so it can read the code and use read-only git commands; its logs and verdict stay in the run directory.
 
 ### Your own rules
 
@@ -127,7 +128,7 @@ Only `ECO_WORKER_API_KEY` is required. Every other variable has a default.
 | `ECO_WORKER_MCP_CONFIG` | (none) | An MCP config file to pass to the worker as `--mcp-config`. |
 | `DIFF_REVIEW_BASE` | `origin/main` | The ref to review against. `--base` overrides it. |
 | `DIFF_REVIEW_BLOCKING` | (off) | Set it to `1` to make a FAIL exit 1. |
-| `DIFF_REVIEW_WORKER` | the bundled `eco-worker` | The command that runs the review. It is called as `<cmd> -t 600 -d <dir> "<prompt>"`. |
+| `DIFF_REVIEW_WORKER` | the bundled `eco-worker` | The command that runs the review. It is called as `<cmd> -t 600 -d <repo root> "<prompt>"` with `ECO_WORKER_LOG_DIR` set to the run (or chunk) directory. |
 | `INSTALL_BIN_DIR` | `~/.local/bin` | Where `install.sh` puts the links. |
 | `XDG_STATE_HOME` | `~/.local/state` | The self-test record is kept under `diff-review/` here. |
 
