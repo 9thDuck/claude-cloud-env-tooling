@@ -213,6 +213,7 @@ envargs+=(ECO_WORKER=1 ECO_WORKER_HOOK_LOG="$hlog" GIT_CONFIG_COUNT=5 GIT_CONFIG
           GIT_CONFIG_KEY_4=url.eco-worker-no-push:/.pushInsteadOf GIT_CONFIG_VALUE_4=git://)
 # The worker runs under its own config dir, so your user MCP config never reaches it: pass one explicitly if you need it.
 mcp=(); [ -n "${ECO_WORKER_MCP_CONFIG:-}" ] && mcp=(--mcp-config "$ECO_WORKER_MCP_CONFIG")
+leg_t0=$(date +%s); : >> "$log"  # the stall clock starts at this leg's launch, not at the previous leg's last write
 env -i "${envargs[@]}" \
 CLAUDE_CONFIG_DIR="$cfg" ANTHROPIC_BASE_URL="$base_url" ANTHROPIC_AUTH_TOKEN="$ECO_WORKER_API_KEY" \
 ANTHROPIC_DEFAULT_OPUS_MODEL="$model" ANTHROPIC_DEFAULT_SONNET_MODEL="$model" \
@@ -235,6 +236,7 @@ while [ -d "/proc/$cpid" ]; do
   fi
   # Stall watchdog: a log with no new line for $stall_s seconds means a hung call; end the run loudly.
   m="$(stat -c %Y "$log")"
+  [ -n "$m" ] && [ "$m" -lt "$leg_t0" ] && m=$leg_t0
   if [ -n "$m" ] && [ "$(( $(date +%s) - m ))" -gt "$stall_s" ]; then stalled=1; echo "eco-worker: STALLED no log output for ${stall_s}s, killing run $run" | tee -a "$log" >&2; kill "$cpid"; break; fi
   sleep 2
 done
