@@ -6,6 +6,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
@@ -165,4 +166,27 @@ describe("eco-worker.sh", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("does not count the idle time before a resume leg as a stall", () => {
+    const lines = [
+      '{"type":"system","subtype":"init","session_id":"s-1"}',
+      '{"type":"result","is_error":false,"result":"done","permission_denials":[],"session_id":"s-1"}',
+    ];
+    const { root, workdir, env } = fakeClaude(`sleep 3\nprintf '%s\\n' '${lines[0]}' '${lines[1]}'`);
+    try {
+      const first = spawnSync(tool("eco-worker.sh"), ["-t", "30", "-d", workdir, "do a thing"], { encoding: "utf8", env });
+      expect(first.status).toBe(0);
+      const logs = join(root, "logs");
+      const run = readdirSync(logs).find((entry) => entry.endsWith(".log")).replace(/\.log$/, "");
+      // The caller resumes 11 minutes after the first leg ended: past the 600 s stall limit.
+      const idle = Date.now() / 1000 - 660;
+      utimesSync(join(logs, `${run}.log`), idle, idle);
+      const resumed = spawnSync(tool("eco-worker.sh"), ["-t", "30", "-d", workdir, "-r", run, "go on"], { encoding: "utf8", env });
+      expect(resumed.stderr).not.toContain("STALLED");
+      expect(resumed.status).toBe(0);
+      expect(statusText(root)).toContain("RESULT=ok");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30000);
 });
