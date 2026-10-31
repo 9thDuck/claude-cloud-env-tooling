@@ -25,6 +25,7 @@ import {
   parseArgs,
   prepareDelta,
   REVIEWER_PERMISSIONS,
+  loadReviewerCommands,
   repoState,
   review,
   stateDir,
@@ -1056,5 +1057,27 @@ describe("repoState", () => {
     extraDirs.push(notRepo);
     writeFileSync(join(notRepo, ".git"), "gitdir: ./missing\n");
     expect(repoState(notRepo).ok).toBe(false);
+  });
+});
+
+describe("loadReviewerCommands", () => {
+  it("lists the shipped file's commands", () => {
+    const loaded = loadReviewerCommands();
+    expect(loaded.ok).toBe(true);
+    expect(loaded.commands).toContain("git diff");
+  });
+
+  it("is not ok for a missing, unparsable or allow-less permissions file", () => {
+    const dir = mkdtempSync(join(WORK, "perms-"));
+    extraDirs.push(dir);
+    const missing = loadReviewerCommands(join(dir, "missing.json"));
+    expect(missing.ok).toBe(false);
+    expect(missing.error).toContain("could not read");
+    writeFileSync(join(dir, "broken.json"), "{");
+    expect(loadReviewerCommands(join(dir, "broken.json")).ok).toBe(false);
+    writeFileSync(join(dir, "empty.json"), "{}");
+    const empty = loadReviewerCommands(join(dir, "empty.json"));
+    expect(empty.ok).toBe(false);
+    expect(empty.error).toContain("no permissions.allow list");
   });
 });

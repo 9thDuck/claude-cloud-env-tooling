@@ -128,16 +128,17 @@ export function repoState(root) {
 
 /**
  * The Bash commands reviewer-permissions.json allows, for the prompt.
+ * @param {string} [path] the permissions file; the shipped one by default.
  * @returns {{ ok: true, commands: string[] } | { ok: false, error: string }}
  */
-function loadReviewerCommands() {
+export function loadReviewerCommands(path = REVIEWER_PERMISSIONS) {
   try {
-    const commands = allowedBashCommands(JSON.parse(readFileSync(REVIEWER_PERMISSIONS, "utf8")));
+    const commands = allowedBashCommands(JSON.parse(readFileSync(path, "utf8")));
     return commands === null
-      ? { ok: false, error: `${REVIEWER_PERMISSIONS} has no permissions.allow list` }
+      ? { ok: false, error: `${path} has no permissions.allow list` }
       : { ok: true, commands };
   } catch (error) {
-    return { ok: false, error: `could not read ${REVIEWER_PERMISSIONS}: ${error.message}` };
+    return { ok: false, error: `could not read ${path}: ${error.message}` };
   }
 }
 
