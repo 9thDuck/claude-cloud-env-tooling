@@ -289,6 +289,25 @@ describe("review: repo read access and chunking", () => {
     expect(markdown).not.toContain("not covered");
   });
 
+  it("is an ERROR when a hunk is larger than the chunk limit (F2)", async () => {
+    const repo = makeRepo("oversize-");
+    const added = Array.from({ length: 40 }, (_, index) => `+const value${index} = ${index};`).join("\n");
+    const diff = `${fileSection("src/feature.js", [`@@ -0,0 +1,40 @@\n${added}`])}\n`;
+    const result = await review({
+      diff,
+      base: "main",
+      rules: defaultRules(),
+      outDir: join(repo, ".diff-review"),
+      blocking: true,
+      workdir: repo,
+      maxChars: 150,
+    });
+    // The worker says PASS, but its single chunk was too big to have been read whole.
+    expect(result.parsed).toMatchObject({ ok: true, verdict: "PASS" });
+    expect(result.decision.exitCode).toBe(1);
+    expect(result.decision.line).toContain("ERROR");
+  });
+
   it("gives each worker run a timeout scaled to its chunk size", async () => {
     const repo = makeRepo("timeout-");
     const workerDir = mkdtempSync(join(WORK, "recording-worker-"));
@@ -364,6 +383,28 @@ touch -d '2020-01-01' "$out/new.blocked.md"
 exit 4
 `;
 
+// A blocked leg whose newest *.blocked.md is a directory: reading it fails, and
+// the review must say so rather than printing "None.".
+const BLOCKED_UNREADABLE_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf 'x\\n' >> "$out/attempts"
+printf '%s\\n' '{"verdict":"FAIL","findings":[{"file":"src/bad.js","line":1,"rule":"No stubs","why":"planted bad file"}],"untested":[]}' > "$out/verdict.json"
+mkdir "$out/run-x.blocked.md"
+touch -d '2030-01-01' "$out/run-x.blocked.md"
+exit 4
+`;
+
+// A blocked leg whose newest *.blocked.md is readable but has no "- " line: the
+// review must say it lists no refused call rather than printing "None.".
+const BLOCKED_EMPTY_FILE_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf 'x\\n' >> "$out/attempts"
+printf '%s\\n' '{"verdict":"FAIL","findings":[{"file":"src/bad.js","line":1,"rule":"No stubs","why":"planted bad file"}],"untested":[]}' > "$out/verdict.json"
+printf '# Refused tool calls in run x\\nRules line.\\n' > "$out/run-x.blocked.md"
+touch -d '2030-01-01' "$out/run-x.blocked.md"
+exit 4
+`;
+
 const BLOCKED_NO_VERDICT_WORKER = `#!/usr/bin/env bash
 out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
 printf 'x\\n' >> "$out/attempts"
@@ -430,6 +471,26 @@ describe("review: a blocked worker (exit 4)", () => {
     expect(markdown).toContain("gh pr view");
     // Only the newest *.blocked.md is carried.
     expect(markdown).not.toContain("old-command");
+  });
+
+  it("reports an unreadable blocked.md instead of listing no refused calls", async () => {
+    const result = await runReview(script("blocked-unreadable.sh", BLOCKED_UNREADABLE_WORKER));
+    expect(result.parsed).toMatchObject({ ok: true, verdict: "FAIL" });
+    expect(attempts(result)).toBe(1);
+    const markdown = readFileSync(result.verdictMd, "utf8");
+    const section = markdown.slice(markdown.indexOf("## Untested / refused calls"));
+    expect(section).not.toContain("None.");
+    expect(section).toContain("could not read");
+  });
+
+  it("reports a blocked.md with no refused-call line instead of listing none", async () => {
+    const result = await runReview(script("blocked-empty-file.sh", BLOCKED_EMPTY_FILE_WORKER));
+    expect(result.parsed).toMatchObject({ ok: true, verdict: "FAIL" });
+    expect(attempts(result)).toBe(1);
+    const markdown = readFileSync(result.verdictMd, "utf8");
+    const section = markdown.slice(markdown.indexOf("## Untested / refused calls"));
+    expect(section).not.toContain("None.");
+    expect(section).toContain("lists no refused call");
   });
 
   it("is an ERROR when exit 4 leaves no verdict, after retrying", async () => {

@@ -12,17 +12,11 @@
  */
 
 /**
- * Largest diff (in characters) this tool was originally willing to hand over in
- * one piece. Review chunking uses DIFF_REVIEW_CHUNK_CHARS instead; this remains
- * the ceiling named in decide()'s truncated-diff message. Nothing is truncated.
- */
-export const MAX_DIFF_CHARS = 200000;
-
-/**
  * Target chunk size (in characters) for one reviewer run. It is deliberately
- * smaller than MAX_DIFF_CHARS: the reviewer reads the repository to verify the
- * diff, so its run time grows with the chunk it is given. A bigger diff is split
- * by file (and a bigger file by hunk) so every file is reviewed; see splitDiff.
+ * smaller than the old 200,000-character one-piece limit: the reviewer reads
+ * the repository to verify the diff, so its run time grows with the chunk it is
+ * given. A bigger diff is split by file (and a bigger file by hunk) so every
+ * file is reviewed; see splitDiff.
  */
 export const DIFF_REVIEW_CHUNK_CHARS = 60000;
 
@@ -206,20 +200,49 @@ export function fileRank(path) {
   return 1;
 }
 
+const C_ESCAPES = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+
+/**
+ * Decode git's C-style quoted path (core.quotePath): `\ooo` octal bytes and
+ * the escapes in C_ESCAPES, read as UTF-8.
+ * @param {string} quoted the path with its surrounding quotes.
+ * @returns {string}
+ * @throws {Error} on an escape git does not write or bytes that are not UTF-8.
+ */
+function unquoteC(quoted) {
+  const bytes = [];
+  const body = quoted.slice(1, -1);
+  for (let index = 0; index < body.length; index += 1) {
+    const char = body[index];
+    if (char !== "\\") {
+      bytes.push(...new TextEncoder().encode(char));
+      continue;
+    }
+    const octal = /^[0-7]{3}/.exec(body.slice(index + 1));
+    if (octal !== null) {
+      bytes.push(Number.parseInt(octal[0], 8));
+      index += 3;
+      continue;
+    }
+    const code = C_ESCAPES[body[index + 1]];
+    if (code === undefined) throw new Error(`diff-review: cannot unquote git path ${quoted}`);
+    bytes.push(code);
+    index += 1;
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(bytes));
+  } catch {
+    throw new Error(`diff-review: git path ${quoted} is not UTF-8`);
+  }
+}
+
 /**
  * A git path from a header, removing the a/ or b/ prefix and quotes.
- * @param {string} value e.g. `b/src/a.js` or `"a/file with space.js"`.
+ * @param {string} value e.g. `b/src/a.js` or `"b/caf\\303\\251.js"`.
  * @returns {string}
  */
 function unquotePath(value) {
-  let path = value;
-  if (path.startsWith('"') && path.endsWith('"')) {
-    try {
-      path = JSON.parse(path);
-    } catch {
-      path = path.slice(1, -1);
-    }
-  }
+  const path = value.startsWith('"') && value.endsWith('"') ? unquoteC(value) : value;
   return path.replace(/^[ab]\//, "");
 }
 
@@ -263,8 +286,9 @@ function sectionPath(text) {
 /**
  * Split a unified diff into per-file sections, preserving every byte.
  * Sections start at `diff --git`; a plain `diff -u` header without it is also
- * recognised. Hunks are tracked so a removed line that looks like a header is
- * never mistaken for one.
+ * recognised. Hunk line counts are tracked, so a removed line that looks like a
+ * header is never mistaken for one and the next file's header is found after
+ * the last hunk.
  * @param {string} diff
  * @returns {Array<{ path: string | null, text: string }>}
  */
@@ -273,11 +297,13 @@ export function splitFileSections(diff) {
   const lines = diff.split("\n");
   const sections = [];
   let current = null;
-  let inHunk = false;
+  let oldLeft = 0;
+  let newLeft = 0;
   const start = (line) => {
     current = { lines: line === null ? [] : [line] };
     sections.push(current);
-    inHunk = false;
+    oldLeft = 0;
+    newLeft = 0;
   };
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
@@ -285,6 +311,7 @@ export function splitFileSections(diff) {
       start(line);
       continue;
     }
+    const inHunk = oldLeft > 0 || newLeft > 0;
     if (!inHunk && line.startsWith("--- ") && /^\+\+\+ /.test(lines[index + 1] ?? "")) {
       const ownHeader = current !== null && current.lines.some((entry) => entry.startsWith("+++ "));
       if (current === null || ownHeader) {
@@ -294,7 +321,18 @@ export function splitFileSections(diff) {
     }
     if (current === null) start(null);
     current.lines.push(line);
-    if (line.startsWith("@@ ")) inHunk = true;
+    const hunk = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(line);
+    if (!inHunk && hunk !== null) {
+      // Unified diff omits ",count" when the count is 1, so an absent group means 1.
+      oldLeft = Number(hunk[1] ?? 1);
+      newLeft = Number(hunk[2] ?? 1);
+    } else if (inHunk) {
+      if (line.startsWith(" ") || line === "") {
+        oldLeft -= 1;
+        newLeft -= 1;
+      } else if (line.startsWith("-")) oldLeft -= 1;
+      else if (line.startsWith("+")) newLeft -= 1;
+    }
   }
   return sections.map((section) => {
     const text = section.lines.join("\n");
@@ -789,17 +827,18 @@ export function parseVerdict(text) {
  *
  * Blocking is the single switch for a reviewer FAIL. ERROR (the review never
  * ran or gave no valid verdict) exits 1 in both modes, so a broken review never
- * looks green; a clean PASS, or an advisory FAIL, exits 0. A PASS on a
- * truncated diff is an ERROR in both modes: the reviewer never saw all of it.
- * @param {{ parsed: ReturnType<typeof parseVerdict>, blocking?: boolean, truncated?: boolean }} options
+ * looks green; a clean PASS, or an advisory FAIL, exits 0. A PASS when a chunk
+ * was larger than the chunk limit is an ERROR in both modes: the reviewer may
+ * not have read that chunk whole.
+ * @param {{ parsed: ReturnType<typeof parseVerdict>, blocking?: boolean, oversize?: boolean }} options
  * @returns {{ exitCode: 0 | 1, line: string }}
  */
-export function decide({ parsed, blocking, truncated = false }) {
+export function decide({ parsed, blocking, oversize = false }) {
   const mode = blocking === true ? "blocking" : "advisory";
-  if (parsed.ok === true && parsed.verdict === "PASS" && truncated === true) {
+  if (parsed.ok === true && parsed.verdict === "PASS" && oversize === true) {
     return {
       exitCode: 1,
-      line: `diff-review: ERROR (${mode}) the diff was cut at ${MAX_DIFF_CHARS} characters, so a PASS cannot stand; split the change into smaller pieces`,
+      line: `diff-review: ERROR (${mode}) a chunk was larger than the chunk limit, so the reviewer may not have read it whole and a PASS cannot stand; split the change into smaller pieces`,
     };
   }
   if (parsed.ok === false) {

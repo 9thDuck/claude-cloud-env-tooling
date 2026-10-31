@@ -92,8 +92,8 @@ describe("decide", () => {
     expect(decide({ parsed, blocking: true }).exitCode).toBe(1);
   });
 
-  it("refuses a PASS on a truncated diff", () => {
-    const decision = decide({ parsed: pass, blocking: false, truncated: true });
+  it("refuses a PASS when a chunk is larger than the chunk limit", () => {
+    const decision = decide({ parsed: pass, blocking: false, oversize: true });
     expect(decision.exitCode).toBe(1);
     expect(decision.line).toContain("ERROR");
   });
@@ -160,6 +160,23 @@ describe("buildPrompt", () => {
 });
 
 describe("splitFileSections", () => {
+  it("splits a plain diff -u patch with several files after each file's hunks", () => {
+    const diff = "--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-a\n+b\n--- a/y.txt\n+++ b/y.txt\n@@ -1,2 +1 @@\n-c\n-d\n+e\n";
+    expect(splitFileSections(diff).map((section) => section.path)).toEqual(["x.txt", "y.txt"]);
+    expect(filesInDiff(diff)).toEqual(["x.txt", "y.txt"]);
+  });
+
+  it("decodes git's octal-quoted non-ASCII paths", () => {
+    const quoted = '"a/caf\\303\\251.txt" "b/caf\\303\\251.txt"';
+    const diff = `diff --git ${quoted}\n--- "a/caf\\303\\251.txt"\n+++ "b/caf\\303\\251.txt"\n@@ -1 +1 @@\n-a\n+b\n`;
+    expect(filesInDiff(diff)).toEqual(["café.txt"]);
+    expect(splitFileSections(diff).map((section) => section.path)).toEqual(["café.txt"]);
+  });
+
+  it("reports a quoted path it cannot decode instead of guessing", () => {
+    expect(() => filesInDiff('diff --git "a/x\\q" "b/x\\q"\n')).toThrow(/cannot unquote git path/);
+  });
+
   it("keeps every byte and names each file", () => {
     const diff = `${fileSection("src/a.js")}\n${fileSection("docs/b.md")}\n`;
     const sections = splitFileSections(diff);
@@ -273,8 +290,9 @@ describe("splitDiff", () => {
 describe("DIFF_REVIEW_CHUNK_CHARS", () => {
   it("defaults review chunks to 60,000 characters, below the old 200,000 limit", () => {
     expect(DIFF_REVIEW_CHUNK_CHARS).toBe(60000);
-    // Three ~24k files: 72k total, so one chunk under the old 200k default and
-    // two chunks under the review target. The worker timeout grows with a chunk.
+    // Three files of about 48k each (a 24k removal plus a 24k addition), about
+    // 144k in total: under the old 200k limit, and one chunk per file under the
+    // review target. The worker timeout grows with a chunk.
     const big = () => `@@ -1 +1 @@\n-${"x".repeat(24000)}\n+${"y".repeat(24000)}`;
     const diff = ["src/a.js", "src/b.js", "src/c.js"].map((path) => fileSection(path, [big()])).join("\n");
     expect(diff.length).toBeGreaterThan(DIFF_REVIEW_CHUNK_CHARS);
