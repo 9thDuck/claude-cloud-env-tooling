@@ -747,7 +747,7 @@ export function ruleCopies(paths) {
  * The Bash commands a permissions file allows, from its `Bash(<cmd>:*)` and
  * `Bash(<cmd>)` allow entries, in file order.
  * @param {{ permissions?: { allow?: unknown[] } }} permissions parsed permissions JSON.
- * @returns {string[]}
+ * @returns {string[] | null} null when the file has no allow list.
  */
 export function allowedBashCommands(permissions) {
   // No allow list is a broken permissions file, not an empty one: the caller errors.

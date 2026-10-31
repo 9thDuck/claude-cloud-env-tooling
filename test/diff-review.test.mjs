@@ -1041,6 +1041,16 @@ describe("repoState", () => {
     expect(repoState(repo).state).not.toBe(before.state);
   });
 
+  it("records an untracked nested repository by name instead of failing", () => {
+    const repo = makeRepo("state-nested-");
+    mkdirSync(join(repo, "inner"));
+    execFileSync("git", ["init", "-q"], { cwd: join(repo, "inner") });
+    writeFileSync(join(repo, "inner", "a.txt"), "a\n");
+    const before = repoState(repo);
+    expect(before.ok).toBe(true);
+    expect(before.state).toContain("?? inner/");
+  });
+
   it("is not ok where git cannot read the repository", () => {
     const notRepo = mkdtempSync(join(WORK, "state-none-"));
     extraDirs.push(notRepo);

@@ -83,8 +83,8 @@ export function stateDir(env = process.env) {
 }
 
 /**
- * The eco-worker rule set for review runs: read and git-read commands only;
- * git add/commit, cp, mv, sed, rm and the like are denied. Rules are not a
+ * The eco-worker rule set for review runs: read and git-read commands only
+ * (sed only as sed -n); git add/commit, cp, mv, rm and the like are denied. Rules are not a
  * security boundary (eco-worker's header says why), so review() also checks
  * that the repository is unchanged after the workers ran (repoState).
  */
@@ -94,8 +94,9 @@ export const REVIEWER_PERMISSIONS = join(TOOL_DIR, "reviewer-permissions.json");
  * A fingerprint of everything a reviewer could change in the repository that
  * git does not ignore: HEAD, the porcelain status, the full diff of tracked
  * files against HEAD (so an edit to an already-modified file shows) and the
- * content of every untracked file. Ignored paths are not covered; the
- * reviewer's own run directory is one of them.
+ * content of every untracked file. Ignored paths and the inside of an
+ * untracked nested repository are not covered; the reviewer's own run
+ * directory is one of the ignored paths.
  * @param {string} root
  * @returns {{ ok: true, state: string } | { ok: false, error: string }}
  */
@@ -113,7 +114,10 @@ export function repoState(root) {
     hash.update(`\0${path}\0`);
     try {
       // A symlink (to a directory, say) is recorded by its target, not read.
+      // git lists an untracked nested repository as one "dir/" entry; it is
+      // recorded by name only, so changes inside it are not covered.
       const full = join(root, path);
+      if (path.endsWith("/")) continue;
       hash.update(lstatSync(full).isSymbolicLink() ? `link ${readlinkSync(full)}` : readFileSync(full));
     } catch (error) {
       return { ok: false, error: `could not read untracked ${path}: ${error.message}` };
