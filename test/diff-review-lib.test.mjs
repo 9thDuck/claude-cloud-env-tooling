@@ -101,6 +101,13 @@ describe("decide", () => {
     expect(decision.exitCode).toBe(1);
     expect(decision.line).toContain("ERROR");
   });
+
+  it("names the run's verdict, so verdict.json follows the exit decision", () => {
+    expect(decide({ parsed: pass, blocking: false }).verdict).toBe("PASS");
+    expect(decide({ parsed: fail, blocking: false }).verdict).toBe("FAIL");
+    expect(decide({ parsed: pass, blocking: false, oversize: true }).verdict).toBe("ERROR");
+    expect(decide({ parsed: { ok: false, error: "no verdict" }, blocking: false }).verdict).toBe("ERROR");
+  });
 });
 
 describe("blockingFromEnv", () => {
