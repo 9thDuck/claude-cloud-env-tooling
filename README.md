@@ -62,6 +62,7 @@ cd your-repo
 diff-review                        # review origin/main...HEAD plus uncommitted and untracked files
 diff-review --base origin/develop
 diff-review --diff-file change.patch
+diff-review --since-verdict .diff-review/<old>/verdict.md   # only what changed since that verdict's head
 ```
 
 Each run writes these files to `<repo>/.diff-review/<timestamp>/`:
@@ -71,7 +72,7 @@ Each run writes these files to `<repo>/.diff-review/<timestamp>/`:
 - `prompt.md` (a single-chunk run keeps it here);
 - the rule files;
 - the reviewer's `verdict.json` (a single-chunk run) or each chunk's `verdict.json`;
-- `verdict.md`, a readable copy of the merged verdict that lists every chunk and every file covered.
+- `verdict.md`, a readable copy of the merged verdict that records the head sha and lists every chunk and every file covered.
 
 git ignores that folder, and only the newest 20 runs are kept.
 
@@ -81,7 +82,11 @@ git ignores that folder, and only the newest 20 runs are kept.
 | FAIL (findings printed) | 0 | 1 |
 | ERROR (no valid verdict, worker failed, setup failed) | 1 | 1 |
 
-A diff larger than `DIFF_REVIEW_CHUNK_CHARS` (60,000 characters by default) is split into chunks: whole files first, ordered with source and tests before `docs/` and `.beads/`, and a single larger file split by hunk. Each chunk gets its own reviewer run, and up to `DIFF_REVIEW_CONCURRENCY` chunks (4 by default, never fewer than 1) run at the same time; the verdicts are merged in chunk order however the workers finish (any error makes the review an ERROR; any finding makes it a FAIL). Every file in the diff must be covered by a chunk, or the review is an ERROR — nothing is silently dropped. The reviewer runs with the repository root as its working directory, so it can read the code and use read-only git commands; its logs and verdict stay in the run directory. Because reading the repository takes time, each run's timeout grows with its chunk: 600 seconds base plus 600 seconds per started 50,000 characters, capped at 3600 seconds.
+A diff larger than `DIFF_REVIEW_CHUNK_CHARS` (60,000 characters by default) is split into chunks: whole files first, ordered with source and tests before `docs/` and `.beads/`, and a single larger file split by hunk. Each chunk gets its own reviewer run, and up to `DIFF_REVIEW_CONCURRENCY` chunks (2 by default, never fewer than 1) run at the same time; the verdicts are merged in chunk order however the workers finish (any error makes the review an ERROR; any finding makes it a FAIL). Every file in the diff must be covered by a chunk, or the review is an ERROR — nothing is silently dropped. The reviewer runs with the repository root as its working directory, so it can read the code and use read-only git commands; its logs and verdict stay in the run directory. Because reading the repository takes time, each run's timeout grows with its chunk: 600 seconds base plus 600 seconds per started 50,000 characters, capped at 3600 seconds. A chunk is capped at `DIFF_REVIEW_MAX_TURNS` assistant turns (40 by default); a cap hit without a valid verdict is an ERROR. A chunk that reports an API rate limit (429) is never retried, every running chunk is cancelled, no further chunk starts, and the review is an ERROR naming the chunk and the error text.
+
+### Delta review
+
+`--since-verdict <path-to-earlier-verdict.md>` reviews only what changed since the head sha recorded in that verdict (`- head: <sha>`), plus any file the earlier verdict had a finding in. The new verdict records its own head, the base, `delta since <sha>, earlier verdict <path> (<result>)`, and lists the unchanged files as covered by the earlier verdict. The delta is FAIL if it has findings, and also if an earlier finding is in a file the delta did not re-review. Delta mode refuses an earlier verdict that is an ERROR or whose head is not an ancestor of HEAD.
 
 ### Your own rules
 
@@ -122,6 +127,8 @@ Only `ECO_WORKER_API_KEY` is required. Every other variable has a default.
 | `ECO_WORKER_MODEL` | `hf:deepseek-ai/DeepSeek-V4.1-Flash-1017` | The model id sent to the endpoint. `-m` overrides it for one run. |
 | `ECO_WORKER_TIMEOUT_S` | `1800` | The time limit for one run, in seconds. `-t` overrides it. |
 | `ECO_WORKER_STALL_S` | `600` | A run that writes no log output for this many seconds is stopped. |
+| `ECO_WORKER_NO_RETRY_429` | `0` | Set to `1` to end the leg at the first API 429 instead of letting the API client retry it. diff-review sets it to `1`. |
+| `ECO_WORKER_MAX_TURNS` | (none) | End the leg after more than this many assistant turns; reported as `error_max_turns` on the RESULT line. diff-review passes `DIFF_REVIEW_MAX_TURNS`. |
 | `ECO_WORKER_LOG_DIR` | `<workdir>/.eco-worker` | Where logs, status, questions and plans go. The folder ignores itself in git. |
 | `ECO_WORKER_PERMISSIONS` | `eco-worker/permissions.json` | Your own allow and deny lists, in the same shape as the bundled file. |
 | `ECO_WORKER_FORWARD_ENV` | (none) | Extra variable names, separated by spaces, to pass to the worker, for example `DATABASE_URL SITE_URL`. The worker gets only a minimal environment: PATH, HOME, proxy and certificate settings, and locale. |
@@ -130,7 +137,8 @@ Only `ECO_WORKER_API_KEY` is required. Every other variable has a default.
 | `DIFF_REVIEW_BLOCKING` | (off) | Set it to `1` to make a FAIL exit 1. |
 | `DIFF_REVIEW_WORKER` | the bundled `eco-worker` | The command that runs the review. It is called as `<cmd> -t <seconds> -d <repo root> "<prompt>"` with `ECO_WORKER_LOG_DIR` set to the run (or chunk) directory. |
 | `DIFF_REVIEW_TIMEOUT_SECONDS` | computed from the chunk | A positive integer that overrides the per-chunk worker timeout (formula and 3600s cap). The default is 600s plus 600s per started 50,000 characters, capped at 3600s. |
-| `DIFF_REVIEW_CONCURRENCY` | `4` | How many chunk reviewers run at the same time. Values below 1 are treated as 1; a non-numeric value uses the default. |
+| `DIFF_REVIEW_CONCURRENCY` | `2` | How many chunk reviewers run at the same time. Values below 1 are treated as 1; a non-numeric value uses the default. |
+| `DIFF_REVIEW_MAX_TURNS` | `40` | Assistant turns allowed per chunk, passed to the worker. A chunk that hits the cap without a valid verdict is an ERROR. |
 | `INSTALL_BIN_DIR` | `~/.local/bin` | Where `install.sh` puts the links. |
 | `XDG_STATE_HOME` | `~/.local/state` | The self-test record is kept under `diff-review/` here. |
 

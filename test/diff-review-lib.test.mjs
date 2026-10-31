@@ -1,22 +1,29 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  DEFAULT_MAX_TURNS,
   DIFF_REVIEW_CHUNK_CHARS,
   blockingFromEnv,
   buildPrompt,
   concurrencyFromEnv,
   coverageProblems,
   decide,
+  deltaReview,
   fileRank,
   filesInDiff,
+  maxTurnsFromEnv,
   mergeVerdicts,
+  noRetry429FromEnv,
   parseConfig,
+  parseEarlierVerdict,
   parseVerdict,
+  rateLimitDetail,
   ruleCopies,
   runPool,
   runsToPrune,
   splitDiff,
   splitFileSections,
+  turnCapDetail,
   workerTimeoutSeconds,
 } from "../diff-review/diff-review-lib.mjs";
 
@@ -124,6 +131,18 @@ describe("buildPrompt", () => {
     expect(prompt).toContain("- src/a.js");
     expect(prompt).toContain("- e2e/a.js");
     expect(prompt).not.toContain("decided");
+  });
+
+  it("states the delta it builds on", () => {
+    const prompt = buildPrompt({
+      base: "main",
+      chunk: { text: "x", files: ["src/a.js"] },
+      rulePaths: ["/r/rules.md"],
+      delta: { since: "a".repeat(40), path: "/runs/old/verdict.md", result: "PASS" },
+    });
+    expect(prompt).toContain(`delta review since ${"a".repeat(40)}`);
+    expect(prompt).toContain("/runs/old/verdict.md");
+    expect(prompt).toContain("returned PASS");
   });
 
   it("says a single diff is complete and names the decided file", () => {
@@ -328,6 +347,103 @@ describe("mergeVerdicts", () => {
   });
 });
 
+describe("parseEarlierVerdict", () => {
+  const head = "b".repeat(40);
+  const verdictMd = (result) =>
+    [
+      `# diff-review: ${result} (advisory) second reader, never acceptance`,
+      "",
+      `- at: 2026-01-01T00:00:00.000Z`,
+      `- head: ${head}`,
+      "- base: origin/main",
+      "- chunks: 1",
+      "",
+      "## Files covered (2)",
+      "",
+      "- src/a.js (chunk 1)",
+      "- src/old.js (chunk 1)",
+      "",
+      "## Findings",
+      "",
+      "- `src/a.js:3` No secrets — adds a key",
+      "",
+    ].join("\n");
+
+  it("reads the head, result, covered files and findings", () => {
+    expect(parseEarlierVerdict(verdictMd("FAIL"))).toEqual({
+      ok: true,
+      head,
+      result: "FAIL",
+      coveredFiles: ["src/a.js", "src/old.js"],
+      findings: [{ file: "src/a.js", line: 3, rule: "No secrets", why: "adds a key" }],
+    });
+    expect(parseEarlierVerdict(verdictMd("PASS"))).toMatchObject({
+      ok: true,
+      result: "PASS",
+    });
+  });
+
+  it("refuses an earlier verdict without a head sha or with no readable result", () => {
+    const noHead = verdictMd("PASS").replace(`- head: ${head}\n`, "");
+    expect(parseEarlierVerdict(noHead).ok).toBe(false);
+    expect(parseEarlierVerdict(noHead).error).toContain("- head:");
+    expect(parseEarlierVerdict("nothing here").ok).toBe(false);
+  });
+
+  it("refuses a FAIL that lists no readable findings", () => {
+    const noFindings = verdictMd("FAIL").replace("- `src/a.js:3` No secrets — adds a key\n", "");
+    const parsed = parseEarlierVerdict(noFindings);
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toContain("no readable findings");
+  });
+});
+
+describe("deltaReview", () => {
+  const pass = { ok: true, verdict: "PASS", findings: [], untested: [] };
+  const fail = { ok: true, verdict: "FAIL", findings: [finding], untested: [] };
+  const earlier = {
+    coveredFiles: ["src/a.js", "src/old.js"],
+    findings: [{ ...finding, file: "src/old.js" }],
+  };
+
+  it("lists the files the earlier verdict still covers", () => {
+    const result = deltaReview({
+      parsed: pass,
+      reviewedFiles: ["src/a.js"],
+      earlier: { ...earlier, findings: [] },
+    });
+    expect(result.unchangedFiles).toEqual(["src/old.js"]);
+    expect(result.parsed).toBe(pass);
+    expect(result.unreviewedFindings).toEqual([]);
+  });
+
+  it("is FAIL when an earlier finding's file was not re-reviewed", () => {
+    const result = deltaReview({ parsed: pass, reviewedFiles: ["src/a.js"], earlier });
+    // src/old.js is unchanged, so its finding was not re-reviewed and survives.
+    expect(result.parsed).toMatchObject({ ok: true, verdict: "FAIL" });
+    expect(result.parsed.findings).toEqual([earlier.findings[0]]);
+    expect(result.unreviewedFindings).toEqual([earlier.findings[0]]);
+  });
+
+  it("drops an earlier finding once its file is re-reviewed and the delta passes", () => {
+    const result = deltaReview({ parsed: pass, reviewedFiles: ["src/a.js", "src/old.js"], earlier });
+    expect(result.parsed).toBe(pass);
+    expect(result.unreviewedFindings).toEqual([]);
+    expect(result.unchangedFiles).toEqual([]);
+  });
+
+  it("keeps a delta FAIL and adds unreviewed earlier findings", () => {
+    const result = deltaReview({ parsed: fail, reviewedFiles: ["src/a.js"], earlier });
+    expect(result.parsed.verdict).toBe("FAIL");
+    expect(result.parsed.findings).toEqual([finding, earlier.findings[0]]);
+  });
+
+  it("leaves an ERROR untouched", () => {
+    const error = { ok: false, error: "rate limited (429)" };
+    expect(deltaReview({ parsed: error, reviewedFiles: [], earlier }).parsed).toBe(error);
+  });
+});
+
 describe("ruleCopies", () => {
   it("numbers copies so equal names never collide", () => {
     expect(ruleCopies(["a/rules.md", "b/rules.md"])).toEqual(["./rules/1-rules.md", "./rules/2-rules.md"]);
@@ -422,14 +538,71 @@ describe("runPool", () => {
 });
 
 describe("concurrencyFromEnv", () => {
-  it("defaults to 4 and never goes below 1", () => {
-    expect(concurrencyFromEnv({})).toBe(4);
+  it("defaults to 2 and never goes below 1", () => {
+    expect(concurrencyFromEnv({})).toBe(2);
     expect(concurrencyFromEnv({ DIFF_REVIEW_CONCURRENCY: "6" })).toBe(6);
     expect(concurrencyFromEnv({ DIFF_REVIEW_CONCURRENCY: "0" })).toBe(1);
     expect(concurrencyFromEnv({ DIFF_REVIEW_CONCURRENCY: "-2" })).toBe(1);
   });
 
   it("falls back to the default for a non-numeric value", () => {
-    expect(concurrencyFromEnv({ DIFF_REVIEW_CONCURRENCY: "many" })).toBe(4);
+    expect(concurrencyFromEnv({ DIFF_REVIEW_CONCURRENCY: "many" })).toBe(2);
+  });
+});
+
+describe("maxTurnsFromEnv", () => {
+  it("defaults to 40 and takes a positive integer override", () => {
+    expect(DEFAULT_MAX_TURNS).toBe(40);
+    expect(maxTurnsFromEnv({})).toBe(40);
+    expect(maxTurnsFromEnv({ DIFF_REVIEW_MAX_TURNS: "7" })).toBe(7);
+  });
+
+  it("ignores a malformed or zero cap", () => {
+    expect(maxTurnsFromEnv({ DIFF_REVIEW_MAX_TURNS: "0" })).toBe(40);
+    expect(maxTurnsFromEnv({ DIFF_REVIEW_MAX_TURNS: "-3" })).toBe(40);
+    expect(maxTurnsFromEnv({ DIFF_REVIEW_MAX_TURNS: "many" })).toBe(40);
+  });
+});
+
+describe("noRetry429FromEnv", () => {
+  it("is on by default and only 0 turns it off", () => {
+    expect(noRetry429FromEnv({})).toBe(true);
+    expect(noRetry429FromEnv({ ECO_WORKER_NO_RETRY_429: "1" })).toBe(true);
+    expect(noRetry429FromEnv({ ECO_WORKER_NO_RETRY_429: "0" })).toBe(false);
+  });
+});
+
+describe("rateLimitDetail", () => {
+  it("reads a 429 from a stream-json event and reports the nested message", () => {
+    const log = [
+      '{"type":"system","subtype":"init"}',
+      '{"type":"system","subtype":"api_retry","error_status":429,"error":{"type":"rate_limit_error","message":"slow down"}}',
+    ].join("\n");
+    expect(rateLimitDetail(log)).toBe("slow down");
+  });
+
+  it("reads an api_error_status=429 status line", () => {
+    expect(rateLimitDetail("eco-worker: RESULT=error exit=1 api_error_status=429 error=rate-limit-rejected(429)")).toContain(
+      "api_error_status=429",
+    );
+  });
+
+  it("is null without a rate-limit rejection", () => {
+    expect(rateLimitDetail('{"type":"result","is_error":false,"result":"ok"}')).toBeNull();
+    expect(rateLimitDetail("")).toBeNull();
+  });
+});
+
+describe("turnCapDetail", () => {
+  it("reads the turn-cap marker", () => {
+    expect(turnCapDetail("eco-worker: RESULT=error exit=1 turns=41 max_turns=40 error=error_max_turns(turn-cap)")).toContain(
+      "error_max_turns",
+    );
+    expect(turnCapDetail('{"type":"result","subtype":"error_max_turns"}')).toContain("error_max_turns");
+  });
+
+  it("does not treat max_turns alone or a normal result as a cap hit", () => {
+    expect(turnCapDetail("max_turns=40 turns=3")).toBeNull();
+    expect(turnCapDetail('{"type":"result","is_error":false,"result":"ok"}')).toBeNull();
   });
 });

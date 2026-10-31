@@ -54,7 +54,7 @@ export function workerTimeoutSeconds(chars, env = process.env) {
 }
 
 /** Chunk workers in flight when DIFF_REVIEW_CONCURRENCY is not set. */
-export const DEFAULT_CONCURRENCY = 4;
+export const DEFAULT_CONCURRENCY = 2;
 
 /**
  * How many chunk workers may run at once. An integer DIFF_REVIEW_CONCURRENCY
@@ -67,6 +67,78 @@ export function concurrencyFromEnv(env = process.env) {
   const raw = env.DIFF_REVIEW_CONCURRENCY;
   if (typeof raw === "string" && /^-?\d+$/.test(raw)) return Math.max(1, Number(raw));
   return DEFAULT_CONCURRENCY;
+}
+
+/** Assistant turns a chunk worker may take when DIFF_REVIEW_MAX_TURNS is not set. */
+export const DEFAULT_MAX_TURNS = 40;
+
+/**
+ * The per-chunk turn cap: a positive integer DIFF_REVIEW_MAX_TURNS, else 40.
+ * The cap is passed to eco-worker as ECO_WORKER_MAX_TURNS; a chunk that reaches
+ * it without a valid verdict is an ERROR, never a PASS.
+ * @param {Record<string, string | undefined>} env
+ * @returns {number}
+ */
+export function maxTurnsFromEnv(env = process.env) {
+  const raw = env.DIFF_REVIEW_MAX_TURNS;
+  if (typeof raw === "string" && /^[1-9]\d*$/.test(raw)) return Number(raw);
+  return DEFAULT_MAX_TURNS;
+}
+
+/**
+ * diff-review asks eco-worker to stop at the first 429 instead of letting the
+ * API client retry it. On by default for diff-review; ECO_WORKER_NO_RETRY_429=0
+ * restores the worker's normal retry behaviour.
+ * @param {Record<string, string | undefined>} env
+ * @returns {boolean}
+ */
+export function noRetry429FromEnv(env = process.env) {
+  return env.ECO_WORKER_NO_RETRY_429 !== "0";
+}
+
+/** A stream-json line that reports a rate-limit rejection. */
+const RATE_LIMIT_RE =
+  /"error_status"\s*:\s*429|"api_error_status"\s*:\s*429|api_error_status=429|"rate_limit_error"/;
+
+/** A worker line that reports the assistant's turn cap. */
+const TURN_CAP_RE = /error_max_turns|turn[- ]cap/i;
+
+/**
+ * The error text of a rate-limit rejection in worker log text, or null. The
+ * first matching line is parsed when it is JSON so a nested error message is
+ * reported instead of the whole event; otherwise the line itself is the
+ * evidence.
+ * @param {string} text log text.
+ * @returns {string | null}
+ */
+export function rateLimitDetail(text) {
+  if (typeof text !== "string" || text.length === 0) return null;
+  const line = text.split("\n").find((entry) => RATE_LIMIT_RE.test(entry));
+  if (line === undefined) return null;
+  let detail = line.trim();
+  try {
+    const event = JSON.parse(line);
+    const nested = event?.error;
+    const message =
+      typeof nested === "string"
+        ? nested
+        : (nested?.message ?? event?.result ?? event?.message);
+    if (typeof message === "string" && message.trim().length > 0) detail = message.trim();
+  } catch {
+    // Not JSON: the matching line is the evidence.
+  }
+  return detail.slice(0, 400);
+}
+
+/**
+ * The text of a turn-cap report in worker log text, or null.
+ * @param {string} text log text.
+ * @returns {string | null}
+ */
+export function turnCapDetail(text) {
+  if (typeof text !== "string" || text.length === 0) return null;
+  const line = text.split("\n").find((entry) => TURN_CAP_RE.test(entry));
+  return line === undefined ? null : line.trim().slice(0, 400);
 }
 
 /**
@@ -405,6 +477,114 @@ export function mergeVerdicts(results) {
 }
 
 /**
+ * The "- " lines under a "## <heading>" block, stopping at the next heading.
+ * @param {string} text
+ * @param {string} heading the heading prefix, e.g. "## Files covered".
+ * @returns {string[]}
+ */
+function sectionLines(text, heading) {
+  const lines = text.split("\n");
+  const start = lines.findIndex((line) => line.startsWith(heading));
+  if (start === -1) return [];
+  const entries = [];
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line.startsWith("## ")) break;
+    if (line.startsWith("- ")) entries.push(line.slice(2).trim());
+  }
+  return entries;
+}
+
+/**
+ * The findings a verdict.md lists, in the same shape parseVerdict uses. A line
+ * that cannot be read is skipped; the caller refuses a FAIL that lists none.
+ * @param {string} text
+ * @returns {Array<{ file: string, line: number | null, rule: string, why: string }>}
+ */
+function findingsFromMarkdown(text) {
+  const findings = [];
+  for (const entry of sectionLines(text, "## Findings")) {
+    const match = /^`(.+?):([^`]*)` (.*)$/.exec(entry);
+    if (match === null) continue;
+    const file = match[1];
+    const rawLine = match[2].trim();
+    const line = rawLine === "" || rawLine === "-" ? null : Number(rawLine);
+    const body = match[3];
+    const split = body.indexOf(" — ");
+    const rule = split === -1 ? body.trim() : body.slice(0, split).trim();
+    const why = split === -1 ? "" : body.slice(split + 3).trim();
+    if (file.length === 0 || rule.length === 0) continue;
+    findings.push({
+      file,
+      line: Number.isFinite(line) ? line : null,
+      rule,
+      why: why.length > 0 ? why : "carried from the earlier verdict",
+    });
+  }
+  return findings;
+}
+
+/**
+ * Read the parts of an earlier verdict.md that delta mode trusts: its head sha,
+ * result, covered files and findings. A missing head line, a missing result or a
+ * FAIL with no readable findings is an error: delta mode must not guess.
+ * @param {string} text verdict.md contents.
+ * @returns {{ ok: true, head: string, result: "PASS" | "FAIL" | "ERROR", coveredFiles: string[], findings: Array<{ file: string, line: number | null, rule: string, why: string }> } | { ok: false, error: string }}
+ */
+export function parseEarlierVerdict(text) {
+  if (typeof text !== "string") return { ok: false, error: "the earlier verdict is not text" };
+  const headLine = text.split("\n").find((line) => line.startsWith("- head:"));
+  const head = headLine === undefined ? "" : headLine.slice("- head:".length).trim();
+  if (!/^[0-9a-f]{40}$/.test(head))
+    return {
+      ok: false,
+      error: "the earlier verdict has no readable '- head: <sha>' line; re-run diff-review on it first",
+    };
+  const resultMatch = /^# diff-review: (PASS|FAIL|ERROR)\b/m.exec(text);
+  if (resultMatch === null)
+    return { ok: false, error: "the earlier verdict has no readable 'diff-review: PASS|FAIL|ERROR' line" };
+  const result = resultMatch[1];
+  const coveredFiles = sectionLines(text, "## Files covered").map((entry) =>
+    entry.replace(/ \(chunk .*\)$/, "").trim(),
+  );
+  const findings = findingsFromMarkdown(text);
+  if (result === "FAIL" && findings.length === 0)
+    return { ok: false, error: "the earlier verdict is FAIL but lists no readable findings" };
+  return { ok: true, head, result, coveredFiles: [...new Set(coveredFiles)].filter(Boolean), findings };
+}
+
+/**
+ * Combine a delta review's verdict with the earlier verdict it builds on.
+ *
+ * Files the earlier verdict covered and this delta did not re-review are listed
+ * as covered by the earlier verdict. If the earlier verdict had a finding in a
+ * file the delta did not re-review, that finding is carried into the result and
+ * the overall verdict is FAIL, even when the delta itself passed: a finding may
+ * not disappear because the file was skipped.
+ * @param {{ parsed: ReturnType<typeof parseVerdict>, reviewedFiles: string[], earlier: { coveredFiles?: string[], findings?: Array<object> } }} options
+ * @returns {{ parsed: ReturnType<typeof parseVerdict>, unchangedFiles: string[], unreviewedFindings: Array<object> }}
+ */
+export function deltaReview({ parsed, reviewedFiles, earlier }) {
+  const reviewed = new Set(Array.isArray(reviewedFiles) ? reviewedFiles : []);
+  const covered = Array.isArray(earlier?.coveredFiles) ? earlier.coveredFiles : [];
+  const earlierFindings = Array.isArray(earlier?.findings) ? earlier.findings : [];
+  const unchangedFiles = covered.filter((file) => !reviewed.has(file));
+  const unreviewedFindings = earlierFindings.filter((finding) => !reviewed.has(finding.file));
+  if (parsed.ok === false || unreviewedFindings.length === 0)
+    return { parsed, unchangedFiles, unreviewedFindings };
+  return {
+    parsed: {
+      ok: true,
+      verdict: "FAIL",
+      findings: [...(parsed.findings ?? []), ...unreviewedFindings],
+      untested: parsed.untested ?? [],
+    },
+    unchangedFiles,
+    unreviewedFindings,
+  };
+}
+
+/**
  * A repo-relative path that stays inside the repo.
  * @param {unknown} path
  * @returns {boolean}
@@ -473,10 +653,11 @@ export const DECIDED_COPY = "./decided.md";
 
 /**
  * The task the reviewer is given.
- * @param {{ base: string, rules?: string[], decided?: boolean, project?: string | null, chunk?: { text: string, files: string[] }, chunkIndex?: number, chunkCount?: number, diffPath?: string, verdictPath?: string, rulePaths?: string[], decidedPath?: string | null, workdir?: string }} options
+ * @param {{ base: string, rules?: string[], decided?: boolean, project?: string | null, chunk?: { text: string, files: string[] }, chunkIndex?: number, chunkCount?: number, diffPath?: string, verdictPath?: string, rulePaths?: string[], decidedPath?: string | null, workdir?: string, delta?: { since: string, path: string, result: string } | null }} options
  *   `chunk` is this run's complete patch; `diffPath`, `verdictPath` and
  *   `rulePaths` are absolute paths (the worker's cwd is the repository root, not
  *   the run directory). `rules` names the rule files when `rulePaths` is absent.
+ *   `delta` names the earlier verdict a delta review builds on.
  * @returns {string} the prompt for the worker.
  */
 export function buildPrompt({
@@ -492,6 +673,7 @@ export function buildPrompt({
   rulePaths = null,
   decidedPath = null,
   workdir = "the repository root",
+  delta = null,
 }) {
   const text = typeof chunk.text === "string" ? chunk.text : "";
   const files = Array.isArray(chunk.files) ? chunk.files : [];
@@ -507,6 +689,11 @@ export function buildPrompt({
     "",
     `Base ref: ${base}. Judge the diff as the change a pull request would land.`,
     chunkLine,
+    ...(delta
+      ? [
+          `This is a delta review since ${delta.since}: only changes since that commit are in the diff. An earlier verdict at ${delta.path} returned ${delta.result}; judge only the delta, and do not re-raise findings its files no longer contain.`,
+        ]
+      : []),
     ...(files.length > 0
       ? ["This chunk covers these files:", ...files.map((file) => `- ${file}`)]
       : ["This chunk holds no file body."]),
