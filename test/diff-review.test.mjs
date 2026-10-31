@@ -794,6 +794,118 @@ describe("review: a blocked worker (exit 4)", () => {
   });
 });
 
+// eco-worker writes <logDir>/<run>.blocked.md when a leg refused a call. A
+// turn cap or a retry can otherwise hide that file behind a valid verdict.
+const REFUSED_TURN_CAP_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf 'x\\n' >> "$out/attempts"
+printf '%s\\n' '{"type":"result","subtype":"error_max_turns","is_error":true}' > "$out/run.log"
+printf '# Refused tool calls in run r1\\n- NOT ALLOWED Bash: \`node -e x\`\\n' > "$out/r1.blocked.md"
+printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
+exit 143
+`;
+
+// Attempt 1 is refused and exits non-zero; a second attempt would be clean and
+// pass. The refusal must end the chunk as an ERROR without that retry.
+const REFUSED_THEN_CLEAN_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf 'x\\n' >> "$out/attempts"
+if [ "$(wc -l < "$out/attempts")" -eq 1 ]; then
+  printf '# Refused tool calls in run r1\\n- NOT ALLOWED Bash: \`node -e x\`\\n' > "$out/r1.blocked.md"
+  exit 1
+fi
+printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
+`;
+
+const CLEAN_PASS_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
+`;
+
+describe("review: a refused call in any attempt", () => {
+  let scriptsDir;
+  let previousWorker;
+
+  function script(name, body) {
+    const path = join(scriptsDir, name);
+    writeFileSync(path, body);
+    chmodSync(path, 0o755);
+    return path;
+  }
+
+  function attempts(result) {
+    return readFileSync(join(result.dir, "chunks", "1", "attempts"), "utf8").trim().split("\n").length;
+  }
+
+  beforeAll(() => {
+    scriptsDir = mkdtempSync(join(WORK, "refused-workers-"));
+    extraDirs.push(scriptsDir);
+    previousWorker = process.env.DIFF_REVIEW_WORKER;
+  });
+
+  afterAll(() => {
+    if (previousWorker === undefined) delete process.env.DIFF_REVIEW_WORKER;
+    else process.env.DIFF_REVIEW_WORKER = previousWorker;
+  });
+
+  it("is an ERROR when a turn-capped leg was refused a call, even with a valid verdict", async () => {
+    process.env.DIFF_REVIEW_WORKER = script("refused-turn-cap.sh", REFUSED_TURN_CAP_WORKER);
+    const repo = makeRepo("refused-cap-");
+    const result = await review({
+      diff: `${fileSection("src/good.js")}\n`,
+      base: "main",
+      rules: defaultRules(),
+      outDir: join(repo, ".diff-review"),
+      blocking: false,
+      readRoot: repo,
+    });
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toContain("a worker attempt refused a call");
+    expect(result.parsed.error).toContain("r1.blocked.md");
+    expect(attempts(result)).toBe(1);
+    expect(JSON.parse(readFileSync(join(result.dir, "verdict.json"), "utf8")).verdict).toBe("ERROR");
+  });
+
+  it("is an ERROR and is not retried when a refused attempt exits non-zero", async () => {
+    process.env.DIFF_REVIEW_WORKER = script("refused-retry.sh", REFUSED_THEN_CLEAN_WORKER);
+    const repo = makeRepo("refused-retry-");
+    const result = await review({
+      diff: `${fileSection("src/good.js")}\n`,
+      base: "main",
+      rules: defaultRules(),
+      outDir: join(repo, ".diff-review"),
+      blocking: false,
+      readRoot: repo,
+    });
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toContain("a worker attempt refused a call");
+    expect(result.parsed.error).toContain("r1.blocked.md");
+    // A refusal ends the chunk: the retry must not spend a second attempt.
+    expect(attempts(result)).toBe(1);
+    expect(JSON.parse(readFileSync(join(result.dir, "verdict.json"), "utf8")).verdict).toBe("ERROR");
+  });
+
+  it("writes ERROR into verdict.json when a PASS covers an oversize chunk", async () => {
+    process.env.DIFF_REVIEW_WORKER = script("oversize-pass.sh", CLEAN_PASS_WORKER);
+    const repo = makeRepo("oversize-verdict-");
+    const added = Array.from({ length: 40 }, (_, index) => `+const value${index} = ${index};`).join("\n");
+    const diff = `${fileSection("src/feature.js", [`@@ -0,0 +1,40 @@\n${added}`])}\n`;
+    const result = await review({
+      diff,
+      base: "main",
+      rules: defaultRules(),
+      outDir: join(repo, ".diff-review"),
+      blocking: true,
+      readRoot: repo,
+      maxChars: 150,
+    });
+    // The worker's file says PASS, so the run's file must not.
+    expect(result.parsed).toMatchObject({ ok: true, verdict: "PASS" });
+    expect(result.decision.verdict).toBe("ERROR");
+    expect(JSON.parse(readFileSync(join(result.dir, "verdict.json"), "utf8")).verdict).toBe("ERROR");
+  });
+});
+
 describe("reviewer git -C rules", () => {
   it("allows read-only git -C on the repository under review and refuses every other -C", async () => {
     const previousWorker = process.env.DIFF_REVIEW_WORKER;
