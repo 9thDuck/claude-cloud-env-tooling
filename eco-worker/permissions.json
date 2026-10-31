@@ -14,7 +14,6 @@
       "Bash(git commit:*)",
       "Bash(git checkout -b:*)",
       "Bash(git checkout --detach:*)",
-      "Bash(git checkout -)",
       "Bash(SITE_URL=http://localhost:4321 pnpm build:*)",
       "Bash(git apply:*)",
       "Bash(git check-ignore:*)",
