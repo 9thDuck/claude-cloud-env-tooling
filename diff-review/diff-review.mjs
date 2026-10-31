@@ -11,9 +11,9 @@
  * Run it inside the repository under review. The rules come from .diff-review.json
  * at the merge-base commit (see README.md), or the bundled rules/default-rules.md
  * when the repo has no config. Each run's diff, prompt, rules and verdict go to
- * <repo>/.diff-review/<UTC timestamp>/, which git ignores. The reviewer writes
- * verdict.json there; the CLI reads only that file (never the worker's stdout),
- * prints the findings, writes verdict.md and exits by decide() (diff-review-lib.mjs).
+ * <repo>/.diff-review/<UTC timestamp>/, which git ignores. Each chunk's reviewer
+ * writes chunks/<n>/verdict.json; the CLI reads only those files (never the
+ * worker's stdout), merges them into the run's own verdict.json, prints the findings, writes verdict.md and exits by decide() (diff-review-lib.mjs).
  *
  * Advisory by default: a FAIL is printed and exits 0. DIFF_REVIEW_BLOCKING=1 makes
  * a FAIL exit 1. An ERROR (the review never ran or gave no valid verdict) exits 1
@@ -26,7 +26,9 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  lstatSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   rmSync,
   statSync,
@@ -39,6 +41,8 @@ import { fileURLToPath } from "node:url";
 import {
   CONFIG_FILE,
   DECIDED_COPY,
+  allowedBashCommands,
+  chunkCharsError,
   chunkCharsFromEnv,
   blockingFromEnv,
   buildPrompt,
@@ -76,6 +80,66 @@ const GIT_MAX_BUFFER = 256 * 1024 * 1024;
 export function stateDir(env = process.env) {
   const base = env.XDG_STATE_HOME ? env.XDG_STATE_HOME : join(homedir(), ".local", "state");
   return join(base, "diff-review");
+}
+
+/**
+ * The eco-worker rule set for review runs: read and git-read commands only
+ * (sed only as sed -n); git add/commit, cp, mv, rm and the like are denied. Rules are not a
+ * security boundary (eco-worker's header says why), so review() also checks
+ * that the repository is unchanged after the workers ran (repoState).
+ */
+export const REVIEWER_PERMISSIONS = join(TOOL_DIR, "reviewer-permissions.json");
+
+/**
+ * A fingerprint of everything a reviewer could change in the repository that
+ * git does not ignore: HEAD, the porcelain status, the full diff of tracked
+ * files against HEAD (so an edit to an already-modified file shows) and the
+ * content of every untracked file. Ignored paths and the inside of an
+ * untracked nested repository are not covered; the reviewer's own run
+ * directory is one of the ignored paths.
+ * @param {string} root
+ * @returns {{ ok: true, state: string } | { ok: false, error: string }}
+ */
+export function repoState(root) {
+  const head = git(["rev-parse", "HEAD"], root);
+  if (!head.ok) return head;
+  const status = git(["-c", "core.quotePath=false", "status", "--porcelain", "--untracked-files=all"], root);
+  if (!status.ok) return status;
+  const tracked = git(["diff", "HEAD", "--binary"], root);
+  if (!tracked.ok) return tracked;
+  const untracked = git(["ls-files", "--others", "--exclude-standard", "-z"], root);
+  if (!untracked.ok) return untracked;
+  const hash = createHash("sha256").update(tracked.stdout);
+  for (const path of untracked.stdout.split("\0").filter(Boolean).sort()) {
+    hash.update(`\0${path}\0`);
+    try {
+      // A symlink (to a directory, say) is recorded by its target, not read.
+      // git lists an untracked nested repository as one "dir/" entry; it is
+      // recorded by name only, so changes inside it are not covered.
+      const full = join(root, path);
+      if (path.endsWith("/")) continue;
+      hash.update(lstatSync(full).isSymbolicLink() ? `link ${readlinkSync(full)}` : readFileSync(full));
+    } catch (error) {
+      return { ok: false, error: `could not read untracked ${path}: ${error.message}` };
+    }
+  }
+  return { ok: true, state: `HEAD ${head.stdout.trim()}\n${status.stdout}\ncontent ${hash.digest("hex")}` };
+}
+
+/**
+ * The Bash commands reviewer-permissions.json allows, for the prompt.
+ * @param {string} [path] the permissions file; the shipped one by default.
+ * @returns {{ ok: true, commands: string[] } | { ok: false, error: string }}
+ */
+export function loadReviewerCommands(path = REVIEWER_PERMISSIONS) {
+  try {
+    const commands = allowedBashCommands(JSON.parse(readFileSync(path, "utf8")));
+    return commands === null
+      ? { ok: false, error: `${path} has no permissions.allow list` }
+      : { ok: true, commands };
+  } catch (error) {
+    return { ok: false, error: `could not read ${path}: ${error.message}` };
+  }
 }
 
 /**
@@ -337,19 +401,29 @@ function spawnWorker(worker, args, options) {
 /**
  * Run the worker once, retrying once on a non-zero exit.
  *
- * The worker's working directory is the repository root, so Read/Grep/Glob and
- * read-only git work there. Its logs go to `logDir` (inside the run directory)
- * through eco-worker's ECO_WORKER_LOG_DIR, and its verdict is written to the
- * absolute `verdictPath` given in the prompt.
+ * Its logs go to `logDir` (inside the run directory) through eco-worker's
+ * ECO_WORKER_LOG_DIR, and its verdict is written to the absolute `verdictPath`
+ * given in the prompt.
  *
  * Chunk workers run concurrently (see runPool), so this is async: the run
  * completes on the child's close event rather than blocking the event loop.
  * `signal` aborts the child when another chunk hits a rate limit.
  *
- * Exit 4 means eco-worker was blocked because at least one optional Bash call
- * was refused. When the leg still wrote a parseable verdict.json the review is
- * usable, so it is accepted without a retry and the refusals are reported.
- * Exit 4 without a valid verdict, and every other non-zero exit, is retried and
+ * The worker runs in `workdir`, the chunk's own run directory, so the only
+ * files its edits are accepted in are its run files. `readRoot` is passed as an
+ * eco-worker `-a "Read(/<root>/**)"` rule: the repository root, or the run
+ * directory when there is no repository, so the rule copies in `<run>/rules/`
+ * stay readable. The rule and reviewer-permissions.json keep the reviewer to
+ * reads, but they are not a boundary (an allowed command can still write
+ * through a shell redirect); review() checks the repository state instead.
+ *
+ * Exit 4 means eco-worker was blocked because at least one call was refused.
+ * A blocked review did not do what it was asked, so it is an ERROR even when it
+ * wrote a verdict, and it is not retried: the same prompt meets the same
+ * refusal. The refused calls are reported. Exit 124 is eco-worker's timeout
+ * (`-t`) or its no-output stall watchdog; it is an ERROR and not retried
+ * either, so one hung or slow leg cannot spend the quota twice; its log says
+ * which of the two it was. Every other non-zero exit is retried once and
  * then reported as an ERROR.
  *
  * A 429 is never retried and is fatal for the whole review: the caller cancels
@@ -357,12 +431,12 @@ function spawnWorker(worker, args, options) {
  * unless the leg still wrote a valid verdict. Both are read from eco-worker's
  * log/status files in `logDir`, and eco-worker runs with
  * ECO_WORKER_NO_RETRY_429=1 and ECO_WORKER_MAX_TURNS derived from the chunk size (maxTurnsFor).
- * `timeoutSeconds` scales with the chunk size: the reviewer reads the
- * repository, so a bigger chunk needs longer.
- * @param {{ workdir: string, logDir: string, verdictPath: string, prompt: string, timeoutSeconds: number, chunkChars: number, signal?: AbortSignal }} options
- * @returns {Promise<{ ok: true, blocked: boolean, retried: boolean, turnCapped?: boolean } | { ok: false, error: string, retried: boolean, rateLimited?: boolean, detail?: string, turnCap?: boolean, cancelled?: boolean }>}
+ * `timeoutSeconds` scales with the chunk size and its turn cap
+ * (workerTimeoutSeconds).
+ * @param {{ workdir: string, readRoot: string, logDir: string, verdictPath: string, prompt: string, timeoutSeconds: number, chunkChars: number, signal?: AbortSignal }} options
+ * @returns {Promise<{ ok: true, retried: boolean, turnCapped?: boolean } | { ok: false, error: string, retried: boolean, rateLimited?: boolean, detail?: string, turnCap?: boolean, cancelled?: boolean, blocked?: boolean, timedOut?: boolean }>}
  */
-async function runWorker({ workdir, logDir, verdictPath, prompt, timeoutSeconds, chunkChars, signal }) {
+async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeoutSeconds, chunkChars, signal }) {
   const worker = workerCommand();
   const maxTurns = maxTurnsFor(chunkChars);
   const noRetry429 = noRetry429FromEnv();
@@ -373,13 +447,16 @@ async function runWorker({ workdir, logDir, verdictPath, prompt, timeoutSeconds,
     console.log(
       `[diff-review] worker attempt ${attempt}/2 (workdir ${workdir}, logs ${logDir}, timeout ${timeoutSeconds}s)`,
     );
-    const result = await spawnWorker(worker, ["-t", String(timeoutSeconds), "-d", workdir, prompt], {
+    // `-a` rules come before `-d`; eco-worker takes the task as the last argument.
+    const result = await spawnWorker(worker, ["-t", String(timeoutSeconds), "-a", `Read(/${readRoot}/**)`, "-d", workdir, prompt], {
       cwd: workdir,
       stdio: "inherit",
       signal,
       env: {
         ...process.env,
         ECO_WORKER_LOG_DIR: logDir,
+        // The reviewer's own read-only rule set, not the builder's permissions.json.
+        ECO_WORKER_PERMISSIONS: REVIEWER_PERMISSIONS,
         ECO_WORKER_NO_RETRY_429: noRetry429 ? "1" : "0",
         ECO_WORKER_MAX_TURNS: String(maxTurns),
       },
@@ -400,7 +477,7 @@ async function runWorker({ workdir, logDir, verdictPath, prompt, timeoutSeconds,
       };
     const validVerdict = readVerdictFile(verdictPath)?.ok === true;
     // A clean exit with a verdict is a finished chunk; nothing else is trusted.
-    if (result.status === 0 && validVerdict) return { ok: true, blocked: false, retried: attempt > 1 };
+    if (result.status === 0 && validVerdict) return { ok: true, retried: attempt > 1 };
     const evidence = logText(logDir);
     // Unreadable evidence is a failed review, not a missing rejection: name the
     // path and error instead of retrying past a 429 nobody could read.
@@ -420,8 +497,7 @@ async function runWorker({ workdir, logDir, verdictPath, prompt, timeoutSeconds,
     // The turn cap is deterministic; retrying would spend quota for the same result.
     const cap = turnCapDetail(evidence.text);
     if (cap !== null) {
-      if (validVerdict)
-        return { ok: true, blocked: false, turnCapped: true, retried: attempt > 1 };
+      if (validVerdict) return { ok: true, turnCapped: true, retried: attempt > 1 };
       return {
         ok: false,
         turnCap: true,
@@ -429,27 +505,36 @@ async function runWorker({ workdir, logDir, verdictPath, prompt, timeoutSeconds,
         retried: attempt > 1,
       };
     }
-    if (result.status === 0) return { ok: true, blocked: false, retried: attempt > 1 };
+    if (result.status === 0) return { ok: true, retried: attempt > 1 };
+    // Blocked: a refused call is part of the review that did not happen.
+    if (result.status === 4)
+      return {
+        ok: false,
+        blocked: true,
+        error: `the worker exited 4 (blocked): refused calls are listed; a blocked review is not a review${validVerdict ? ", so its verdict.json is not used" : ""}`,
+        retried: attempt > 1,
+      };
+    // Timed out or stalled: a retry would spend the quota a second time.
+    if (result.status === 124)
+      return {
+        ok: false,
+        timedOut: true,
+        error: `the worker timed out (exit 124: the ${timeoutSeconds}s limit or eco-worker's stall watchdog; its log says which); not retried`,
+        retried: attempt > 1,
+      };
     lastFailure = result.status === null ? `was killed by ${result.signal}` : `exited ${result.status}`;
-    // A blocked leg that still wrote its verdict reviewed the chunk; accept it.
-    if (result.status === 4 && readVerdictFile(verdictPath)?.ok === true)
-      return { ok: true, blocked: true, retried: attempt > 1 };
     // Loud: a failed reviewer run is a failed review, never a quiet PASS.
     console.error(`[diff-review] FAILED: worker ${lastFailure} on attempt ${attempt}/2`);
   }
-  const error =
-    lastFailure === "exited 4"
-      ? "the worker exited 4 (blocked) twice without a valid verdict.json"
-      : `the worker ${lastFailure} twice`;
-  return { ok: false, error, retried: true };
+  return { ok: false, error: `the worker ${lastFailure} twice`, retried: true };
 }
 
 /**
  * Read one chunk's verdict.json after its worker run. Errors are values, never
- * exceptions: a missing or malformed file is an ERROR for that chunk. A blocked
- * run's refused calls are carried alongside the verdict so they reach verdict.md.
+ * exceptions: a missing or malformed file is an ERROR for that chunk. A failed
+ * run's refused calls are carried alongside the error so they reach verdict.md.
  * @param {string} verdictPath absolute path the prompt told the worker to write.
- * @param {{ ok: true, blocked: boolean, retried: boolean } | { ok: false, error: string, retried: boolean }} run
+ * @param {{ ok: true, retried: boolean, turnCapped?: boolean } | { ok: false, error: string, retried: boolean }} run
  * @param {string} logDir
  * @returns {{ parsed: ReturnType<typeof parseVerdict>, workerNote: string, refused: string[] }}
  */
@@ -464,17 +549,9 @@ function readChunkVerdict(verdictPath, run, logDir) {
   const parsed = readVerdictFile(verdictPath);
   if (parsed === null) {
     // Never trust the worker's stdout; a run that wrote no file reviewed nothing.
-    const error = run.blocked
-      ? `the worker exited 4 (blocked) but wrote no verdict.json (${verdictPath})`
-      : `the worker exited 0 but wrote no verdict.json (${verdictPath})`;
+    const error = `the worker exited 0 but wrote no verdict.json (${verdictPath})`;
     return { parsed: { ok: false, error }, workerNote: `ERROR: ${error}`, refused: refusedCalls(logDir) };
   }
-  if (run.blocked)
-    return {
-      parsed,
-      workerNote: "exit 4 (blocked): refused calls listed",
-      refused: refusedCalls(logDir),
-    };
   if (run.turnCapped)
     return { parsed, workerNote: "turn cap reached, but verdict.json is valid", refused: [] };
   return {
@@ -488,9 +565,12 @@ function readChunkVerdict(verdictPath, run, logDir) {
  * Review one diff and leave the evidence on disk.
  *
  * A diff over DIFF_REVIEW_CHUNK_CHARS is split into chunks (splitDiff); each
- * chunk gets its own worker run in `<run>/chunks/<n>/`, with the repository root
- * as the worker's working directory so it can read the code the diff talks
- * about. Each run's timeout scales with its chunk size (workerTimeoutSeconds).
+ * chunk gets its own worker run in `<run>/chunks/<n>/` (a one-chunk diff too),
+ * with that directory as the worker's working directory and the repository root
+ * (`readRoot`) readable, so it can read the code the diff talks about. A review
+ * whose reviewer changed the repository (repoState before and after) is an
+ * ERROR. Each run's timeout scales with its chunk size and
+ * turn cap (workerTimeoutSeconds).
  * Chunk workers run concurrently, at most DIFF_REVIEW_CONCURRENCY (default 2,
  * minimum 1) at a time; results are merged in chunk order regardless of which
  * worker finished first. The verdicts are merged (any chunk ERROR => ERROR, else
@@ -504,10 +584,16 @@ function readChunkVerdict(verdictPath, run, logDir) {
  *
  * `delta` turns this into an incremental review of the diff since an earlier
  * verdict's head; deltaReview combines the result with the earlier verdict.
- * @param {{ diff: string, base: string, rules: ReturnType<typeof loadRules>, outDir: string, label?: string, blocking: boolean, workdir?: string, maxChars?: number, head?: string | null, delta?: { since: string, path: string, result: string, earlier: ReturnType<typeof parseEarlierVerdict> } | null }} options
- *   `outDir` holds one directory per run; the oldest are pruned. `workdir` is
- *   the repository root (defaults to `outDir` for the self-test). `head` is the
- *   commit under review, recorded in verdict.md.
+ *
+ * The run's own verdict.json (`<run>/verdict.json`, next to verdict.md) is
+ * written by diff-review, never by a worker: `verdict` is PASS, FAIL or ERROR,
+ * with `error` set on an ERROR, so a reader of the file alone cannot mistake a
+ * failed review for a pass. Each worker's raw file stays in its chunk directory.
+ * @param {{ diff: string, base: string, rules: ReturnType<typeof loadRules>, outDir: string, label?: string, blocking: boolean, readRoot?: string | null, maxChars?: number, head?: string | null, delta?: { since: string, path: string, result: string, earlier: ReturnType<typeof parseEarlierVerdict> } | null }} options
+ *   `outDir` holds one directory per run; the oldest are pruned. `readRoot` is
+ *   the repository root the worker may read (null for the self-test, which
+ *   reads nothing outside its run). `head` is the commit under review, recorded
+ *   in verdict.md and verdict.json.
  * @returns {Promise<{ parsed: ReturnType<typeof parseVerdict>, decision: ReturnType<typeof decide>, dir: string, verdictMd: string }>}
  */
 export async function review({
@@ -517,7 +603,7 @@ export async function review({
   outDir,
   label = "",
   blocking,
-  workdir = null,
+  readRoot = null,
   maxChars = chunkCharsFromEnv(),
   head = null,
   delta = null,
@@ -533,15 +619,16 @@ export async function review({
     .map((entry) => entry.name);
   for (const old of runsToPrune(names)) rmSync(join(runsDir, old), { recursive: true });
 
-  const runWorkdir = resolve(workdir ?? runsDir);
+  const repoDir = readRoot === null ? null : resolve(readRoot);
   // The whole diff stays as evidence; each chunk gets its own patch file.
   writeFileSync(join(dir, "diff.patch"), diff);
   const split = splitDiff(diff, { maxChars });
   const coverage = coverageProblems(diff, split.chunks);
   const chunkRows = split.chunks.map((chunk, index) => {
     const chunkIndex = index + 1;
-    const chunkDir =
-      split.chunks.length === 1 ? dir : resolve(join(dir, "chunks", String(chunkIndex)));
+    // Every chunk, even the only one, has its own directory: <run>/verdict.json
+    // belongs to diff-review, so no worker may write there.
+    const chunkDir = resolve(join(dir, "chunks", String(chunkIndex)));
     return {
       index: chunkIndex,
       chunk,
@@ -568,9 +655,18 @@ export async function review({
     }
   }
 
+  // A reviewer that changed the repository did not review what it was given.
+  const reviewerCommands = loadReviewerCommands();
+  const stateBefore = repoDir === null ? null : repoState(repoDir);
   let parsed;
   let deltaOutcome = null;
-  if (!rules.ok) {
+  if (!reviewerCommands.ok) {
+    // The prompt must name the reviewer's commands, or its first guess blocks the run.
+    parsed = { ok: false, error: reviewerCommands.error };
+  } else if (stateBefore !== null && !stateBefore.ok) {
+    // Without a before-state the read-only check cannot run, so no review starts.
+    parsed = { ok: false, error: `could not record the repository state at ${repoDir} before the review, so the read-only check cannot run: ${stateBefore.error}` };
+  } else if (!rules.ok) {
     // No rules, no review: a reviewer without them would judge from memory.
     parsed = { ok: false, error: rules.error };
   } else if (coverage.length > 0) {
@@ -605,7 +701,7 @@ export async function review({
       }
       mkdirSync(row.dir, { recursive: true });
       const chunkPatch = resolve(join(row.dir, "diff.patch"));
-      if (split.chunks.length > 1) writeFileSync(chunkPatch, row.chunk.text);
+      writeFileSync(chunkPatch, row.chunk.text);
       const verdictPath = resolve(join(row.dir, "verdict.json"));
       const prompt = buildPrompt({
         base,
@@ -619,12 +715,15 @@ export async function review({
         verdictPath,
         rulePaths: ruleFiles,
         decidedPath,
-        workdir: runWorkdir,
+        workdir: row.dir,
+        readRoot: repoDir,
+        allowedCommands: reviewerCommands.commands,
         delta,
       });
       writeFileSync(join(row.dir, "prompt.md"), prompt);
       const run = await runWorker({
-        workdir: runWorkdir,
+        workdir: row.dir,
+        readRoot: repoDir ?? resolve(dir),
         logDir: row.dir,
         verdictPath,
         prompt,
@@ -652,6 +751,16 @@ export async function review({
           };
   }
 
+  if (stateBefore !== null && stateBefore.ok && chunkRows.length > 0) {
+    const stateAfter = repoState(repoDir);
+    if (!stateAfter.ok || stateAfter.state !== stateBefore.state) {
+      const changed = stateAfter.ok
+        ? `the reviewer changed the repository at ${repoDir} (HEAD, git status or file contents differ from before the review); revert its changes and re-run`
+        : `could not record the repository state at ${repoDir} after the review: ${stateAfter.error}`;
+      parsed = { ok: false, error: parsed.ok === false ? `${parsed.error}; also ${changed}` : changed };
+    }
+  }
+
   if (delta !== null && rules.ok && coverage.length === 0) {
     deltaOutcome = deltaReview({
       parsed,
@@ -663,6 +772,7 @@ export async function review({
 
   const oversize = chunkRows.some((row) => row.oversize === true);
   const decision = decide({ parsed, blocking, oversize });
+  writeFileSync(join(dir, "verdict.json"), `${JSON.stringify(runVerdict({ parsed, base, head }), null, 2)}\n`);
   const verdictMd = join(dir, "verdict.md");
   writeFileSync(
     verdictMd,
@@ -674,7 +784,7 @@ export async function review({
       diff,
       chunkRows,
       files: split.files,
-      runWorkdir,
+      repoDir,
       coverage,
       delta,
       deltaOutcome,
@@ -684,9 +794,20 @@ export async function review({
 }
 
 /**
+ * The run's machine-readable verdict: the merged result, never a worker's raw
+ * file, so an ERROR is written as an ERROR.
+ * @param {{ parsed: ReturnType<typeof parseVerdict>, base: string, head: string | null }} options
+ * @returns {{ verdict: "PASS" | "FAIL" | "ERROR", head: string | null, base: string, error?: string, findings: Array<object>, untested: string[] }}
+ */
+export function runVerdict({ parsed, base, head }) {
+  if (parsed.ok === false) return { verdict: "ERROR", head, base, error: parsed.error, findings: [], untested: [] };
+  return { verdict: parsed.verdict, head, base, findings: parsed.findings, untested: parsed.untested };
+}
+
+/**
  * The human record of one review, next to the patch and the raw verdict. It
  * lists every chunk and every file the diff names, so coverage is auditable.
- * @param {{ parsed: ReturnType<typeof parseVerdict>, decision: ReturnType<typeof decide>, base: string, head: string | null, diff: string, chunkRows: Array<object>, files: string[], runWorkdir: string, coverage: string[], delta: { since: string, path: string, result: string } | null, deltaOutcome: { unchangedFiles: string[] } | null }} options
+ * @param {{ parsed: ReturnType<typeof parseVerdict>, decision: ReturnType<typeof decide>, base: string, head: string | null, diff: string, chunkRows: Array<object>, files: string[], repoDir: string | null, coverage: string[], delta: { since: string, path: string, result: string } | null, deltaOutcome: { unchangedFiles: string[] } | null }} options
  * @returns {string}
  */
 function renderVerdictMarkdown({
@@ -697,7 +818,7 @@ function renderVerdictMarkdown({
   diff,
   chunkRows,
   files,
-  runWorkdir,
+  repoDir,
   coverage,
   delta,
   deltaOutcome,
@@ -713,7 +834,7 @@ function renderVerdictMarkdown({
       ? []
       : [`- delta since ${delta.since}, earlier verdict ${delta.path} (${delta.result})`]),
     `- diff: ${diff.length} characters`,
-    `- working directory: ${runWorkdir}`,
+    `- repository (read-only for the worker): ${repoDir ?? "(none)"}`,
     `- chunks: ${chunkRows.length}`,
     `- files covered: ${files.length}`,
     "",
@@ -771,8 +892,8 @@ function renderVerdictMarkdown({
     for (const entry of parsed.untested) lines.push(`- ${entry}`);
     lines.push("");
   }
-  // A blocked worker leg still reviewed the chunk; its refused calls are evidence,
-  // not something to hide behind a PASS or FAIL line.
+  // A blocked worker leg is an ERROR; its refused calls say what it was refused,
+  // so the next run's permissions or prompt can be fixed.
   const refused = chunkRows.flatMap((row) =>
     (row.refused ?? []).map((entry) => ({ index: row.index, entry })),
   );
@@ -981,6 +1102,7 @@ function status() {
     ...FIXTURE_FILES.map((name) => join(FIXTURES, name)),
     join(FIXTURES, "fixtures.sha256"),
     DEFAULT_RULES,
+    REVIEWER_PERMISSIONS,
   ];
   for (const file of required) {
     if (!existsSync(file)) {
@@ -1085,6 +1207,8 @@ async function main(argv) {
     return 0;
   }
   if (options.mode === "status") return status();
+  const chunkProblem = chunkCharsError();
+  if (chunkProblem !== null) return setupError(chunkProblem);
   if (options.mode === "self-test") return await selfTest();
   const top = repoRoot();
   if (!top.ok) return setupError(top.error);
@@ -1125,7 +1249,7 @@ async function main(argv) {
     rules,
     outDir: join(top.root, ".diff-review"),
     blocking: blockingFromEnv(),
-    workdir: top.root,
+    readRoot: top.root,
     head,
     delta,
   });

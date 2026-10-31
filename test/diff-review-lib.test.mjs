@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   DIFF_REVIEW_CHUNK_CHARS,
+  allowedBashCommands,
   blockingFromEnv,
   buildPrompt,
   concurrencyFromEnv,
@@ -11,7 +12,9 @@ import {
   fileRank,
   filesInDiff,
   maxTurnsFor,
+  chunkCharsError,
   chunkCharsFromEnv,
+  DIFF_REVIEW_CHUNK_CHARS_MIN,
   mergeVerdicts,
   noRetry429FromEnv,
   parseConfig,
@@ -108,7 +111,27 @@ describe("blockingFromEnv", () => {
   });
 });
 
+describe("allowedBashCommands", () => {
+  it("lists the Bash commands of the allow list, with or without :*", () => {
+    expect(
+      allowedBashCommands({
+        permissions: { allow: ["Read(/x/**)", "Bash(git show:*)", "Bash(ls)", 3], deny: ["Bash(rm:*)"] },
+      }),
+    ).toEqual(["git show", "ls"]);
+    expect(allowedBashCommands({ permissions: { allow: [] } })).toEqual([]);
+    expect(allowedBashCommands({})).toBeNull();
+  });
+});
+
 describe("buildPrompt", () => {
+  it("names the allowed commands and says a refused call is an ERROR", () => {
+    const prompt = buildPrompt({ base: "main", allowedCommands: ["git show", "grep"] });
+    expect(prompt).toContain("Bash is limited to these commands: git show, grep.");
+    expect(prompt).toContain("a refused call makes the whole review an ERROR");
+    expect(prompt).toContain("Run one command per Bash call");
+    expect(prompt).toContain("no cd");
+  });
+
   it("names absolute rule paths, the project, the files and the chunk", () => {
     const prompt = buildPrompt({
       base: "origin/main",
@@ -119,7 +142,8 @@ describe("buildPrompt", () => {
       verdictPath: "/runs/1/chunks/2/verdict.json",
       rulePaths: ["/runs/1/rules/1-a.md", "/runs/1/rules/2-rules.md"],
       project: "A shop",
-      workdir: "/repo",
+      workdir: "/runs/1/chunks/2",
+      readRoot: "/repo",
     });
     expect(prompt).toContain("- /runs/1/rules/1-a.md");
     expect(prompt).toContain("- /runs/1/rules/2-rules.md");
@@ -127,7 +151,13 @@ describe("buildPrompt", () => {
     expect(prompt).toContain("chunk 2 of 3");
     expect(prompt).toContain("/runs/1/chunks/2/diff.patch");
     expect(prompt).toContain("/runs/1/chunks/2/verdict.json");
-    expect(prompt).toContain("Your working directory is /repo");
+    expect(prompt).toContain("Your working directory is /runs/1/chunks/2");
+    expect(prompt).toContain("The repository is at /repo");
+    expect(prompt).toContain("plain git show");
+    expect(prompt).toContain("Your working directory is /runs/1/chunks/2, this chunk's directory");
+    expect(prompt).toContain("any change makes the review an ERROR");
+    expect(prompt).not.toContain("Bash is limited to");
+    expect(prompt).toContain("git -C is refused");
     expect(prompt).toContain("- src/a.js");
     expect(prompt).toContain("- e2e/a.js");
     expect(prompt).not.toContain("decided");
@@ -306,15 +336,29 @@ describe("DIFF_REVIEW_CHUNK_CHARS", () => {
 
 describe("workerTimeoutSeconds", () => {
   it("scales 600s base by 600s per started 50,000 characters", () => {
-    expect(workerTimeoutSeconds(0, {})).toBe(600);
-    expect(workerTimeoutSeconds(1, {})).toBe(1200);
-    expect(workerTimeoutSeconds(50000, {})).toBe(1200);
-    expect(workerTimeoutSeconds(50001, {})).toBe(1800);
-    expect(workerTimeoutSeconds(200000, {})).toBe(3000);
+    // maxTurns 1 keeps the turn-derived floor (30s) out of the way.
+    expect(workerTimeoutSeconds(0, {}, 1)).toBe(600);
+    expect(workerTimeoutSeconds(1, {}, 1)).toBe(1200);
+    expect(workerTimeoutSeconds(50000, {}, 1)).toBe(1200);
+    expect(workerTimeoutSeconds(50001, {}, 1)).toBe(1800);
+    expect(workerTimeoutSeconds(200000, {}, 1)).toBe(3000);
   });
 
-  it("caps at 3600s however large the chunk", () => {
-    expect(workerTimeoutSeconds(1000000, {})).toBe(3600);
+  it("caps the size formula at 3600s however large the chunk", () => {
+    expect(workerTimeoutSeconds(1000000, {}, 1)).toBe(3600);
+  });
+
+  it("allows 30s per turn of the cap when the turn-derived timeout is larger", () => {
+    // 20K default chunk: 60 turns = 1800s beats the 1200s size formula.
+    expect(workerTimeoutSeconds(20000, {})).toBe(1800);
+    // 52K chunk (the P1a case): 92 turns = 2760s beats 1800s.
+    expect(workerTimeoutSeconds(52000, {})).toBe(2760);
+    // A raised DIFF_REVIEW_MAX_TURNS raises the timeout with it.
+    expect(workerTimeoutSeconds(20000, { DIFF_REVIEW_MAX_TURNS: "200" })).toBe(6000);
+  });
+
+  it("caps the turn-derived timeout at 7200s", () => {
+    expect(workerTimeoutSeconds(20000, { DIFF_REVIEW_MAX_TURNS: "100000" })).toBe(7200);
   });
 
   it("lets DIFF_REVIEW_TIMEOUT_SECONDS override the formula and the cap", () => {
@@ -323,11 +367,12 @@ describe("workerTimeoutSeconds", () => {
   });
 
   it("ignores a malformed override instead of passing it to the worker", () => {
-    expect(workerTimeoutSeconds(50001, { DIFF_REVIEW_TIMEOUT_SECONDS: "0" })).toBe(1800);
-    expect(workerTimeoutSeconds(50001, { DIFF_REVIEW_TIMEOUT_SECONDS: "abc" })).toBe(1800);
-    expect(workerTimeoutSeconds(50001, { DIFF_REVIEW_TIMEOUT_SECONDS: "1.5" })).toBe(1800);
+    expect(workerTimeoutSeconds(50001, { DIFF_REVIEW_TIMEOUT_SECONDS: "0" }, 1)).toBe(1800);
+    expect(workerTimeoutSeconds(50001, { DIFF_REVIEW_TIMEOUT_SECONDS: "abc" }, 1)).toBe(1800);
+    expect(workerTimeoutSeconds(50001, { DIFF_REVIEW_TIMEOUT_SECONDS: "1.5" }, 1)).toBe(1800);
   });
 });
+
 
 describe("mergeVerdicts", () => {
   const pass = { ok: true, verdict: "PASS", findings: [], untested: [] };
@@ -606,9 +651,24 @@ describe("chunkCharsFromEnv", () => {
     expect(chunkCharsFromEnv({ DIFF_REVIEW_CHUNK_CHARS: "8000" })).toBe(8000);
   });
 
-  it("ignores a bad value", () => {
+  it("defaults to 20000 when unset or empty, and falls back for a value chunkCharsError rejects", () => {
     expect(chunkCharsFromEnv({ DIFF_REVIEW_CHUNK_CHARS: "0" })).toBe(20000);
     expect(chunkCharsFromEnv({ DIFF_REVIEW_CHUNK_CHARS: "big" })).toBe(20000);
+    expect(chunkCharsFromEnv({ DIFF_REVIEW_CHUNK_CHARS: "1" })).toBe(20000);
+  });
+});
+
+describe("chunkCharsError", () => {
+  it("accepts unset and any integer from the minimum up", () => {
+    expect(chunkCharsError({})).toBeNull();
+    expect(chunkCharsError({ DIFF_REVIEW_CHUNK_CHARS: "" })).toBeNull();
+    expect(chunkCharsError({ DIFF_REVIEW_CHUNK_CHARS: String(DIFF_REVIEW_CHUNK_CHARS_MIN) })).toBeNull();
+    expect(chunkCharsError({ DIFF_REVIEW_CHUNK_CHARS: "52000" })).toBeNull();
+  });
+
+  it("rejects 1, anything under the minimum and anything not an integer", () => {
+    for (const raw of ["1", "4999", "0", "-5000", "big", "8000.5"])
+      expect(chunkCharsError({ DIFF_REVIEW_CHUNK_CHARS: raw })).toContain(`DIFF_REVIEW_CHUNK_CHARS=${raw}`);
   });
 });
 
@@ -640,6 +700,15 @@ describe("rateLimitDetail", () => {
     expect(rateLimitDetail("")).toBeNull();
   });
 
+  it("ignores 429 text inside tool output and model text (planted: a reviewer reading this file)", () => {
+    const log = [
+      '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"/\\"rate_limit_error\\"/ and \\"error_status\\":429"}]}}',
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"api_error_status=429 is matched"}]}}',
+    ].join("\n");
+    expect(rateLimitDetail(log)).toBeNull();
+    expect(rateLimitDetail(`${log}\n{"type":"result","api_error_status":429,"result":"quota gone"}`)).toBe("quota gone");
+  });
+
   it("ignores 429 text echoed in a user/assistant event or in plain output", () => {
     const echoed = [
       '{"type":"user","api_error_status":429,"message":{"content":[{"type":"tool_result","content":"api_error_status=429"}]}}',
@@ -662,6 +731,7 @@ describe("turnCapDetail", () => {
   it("does not treat max_turns alone or a normal result as a cap hit", () => {
     expect(turnCapDetail("max_turns=40 turns=3")).toBeNull();
     expect(turnCapDetail('{"type":"result","is_error":false,"result":"ok"}')).toBeNull();
+    expect(turnCapDetail('{"type":"user","message":{"content":"error_max_turns and the turn cap"}}')).toBeNull();
   });
 
   it("ignores turn-cap text echoed in a user/assistant event or in prose", () => {

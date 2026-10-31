@@ -2,15 +2,17 @@ import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { workerTimeoutSeconds } from "../diff-review/diff-review-lib.mjs";
@@ -23,6 +25,9 @@ import {
   mergeBaseOf,
   parseArgs,
   prepareDelta,
+  REVIEWER_PERMISSIONS,
+  loadReviewerCommands,
+  repoState,
   review,
   stateDir,
   workerCommand,
@@ -61,15 +66,22 @@ function fileSection(path, hunks = ["@@ -1 +1 @@\n-a\n+b"]) {
   ].join("\n");
 }
 
-// Proves where the worker runs: it reads ./app.js, a repo file outside the diff,
-// and writes its verdict to the run directory. The old spawn used the run
-// directory as cwd, where app.js does not exist.
+// Proves what the worker may read: it reads app.js, a repo file outside the
+// diff, from the root its -a "Read(/<root>/**)" rule grants, and writes its
+// verdict to its chunk directory. Without the rule it has no repo to read.
 const FAKE_WORKER = `#!/usr/bin/env bash
 set -euo pipefail
 out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+root=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-a" ]; then root="\${arg#Read(/}"; root="\${root%/\*\*)}"; fi
+  prev="$arg"
+done
 for last in "$@"; do :; done
 prompt="$last"
-value="$(cat app.js)"
+[ -n "$root" ] || { echo "no read rule" >&2; exit 1; }
+value="$(cat "$root/app.js")"
 printf 'cwd=%s\\nread app.js=%s\\n' "$PWD" "$value" > "$out/c1-read-proof.txt"
 if printf '%s' "$prompt" | grep -q 'src/bad.js'; then
   printf '%s\\n' '{"verdict":"FAIL","findings":[{"file":"src/bad.js","line":1,"rule":"No stubs","why":"planted bad file"}],"untested":[]}' > "$out/verdict.json"
@@ -213,6 +225,64 @@ describe("CLI", () => {
     expect(result.status).toBe(2);
     expect(result.stderr).toContain("usage: diff-review");
   });
+
+  it("is an ERROR (exit 1) before any review when DIFF_REVIEW_CHUNK_CHARS is below the minimum", () => {
+    const result = spawnSync("node", [resolve(import.meta.dirname, "..", "diff-review", "diff-review.mjs"), "--self-test"], {
+      encoding: "utf8",
+      env: { ...process.env, DIFF_REVIEW_CHUNK_CHARS: "1", DIFF_REVIEW_WORKER: "/nonexistent-worker" },
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr + result.stdout).toContain("DIFF_REVIEW_CHUNK_CHARS=1 is not an integer of at least 5000");
+  });
+});
+
+// The CLI finds its tool files from its own path, so a copy of the tool with
+// its own XDG state is a complete installation. The state holds a fresh passing
+// self-test record, so the one file a test removes is the only fault --status
+// can report.
+describe("CLI: --status requires reviewer-permissions.json", () => {
+  const TOOL = resolve(import.meta.dirname, "..", "diff-review");
+
+  function toolCopy(prefix) {
+    const copy = mkdtempSync(join(WORK, prefix));
+    extraDirs.push(copy);
+    cpSync(TOOL, copy, { recursive: true });
+    const stateHome = mkdtempSync(join(WORK, "status-state-"));
+    extraDirs.push(stateHome);
+    const state = join(stateHome, "diff-review");
+    mkdirSync(state, { recursive: true });
+    // Newer than every copied file, so freshness is not what --status reports.
+    writeFileSync(
+      join(state, "self-test.json"),
+      `${JSON.stringify({
+        at: new Date(Date.now() + 60_000).toISOString(),
+        badVerdict: "FAIL",
+        goodVerdict: "PASS",
+        pass: true,
+      })}\n`,
+    );
+    return { path: join(copy, "diff-review.mjs"), env: { ...process.env, XDG_STATE_HOME: stateHome } };
+  }
+
+  function runStatus(tool) {
+    return spawnSync("node", [tool.path, "--status"], { encoding: "utf8", env: tool.env });
+  }
+
+  it("fails naming reviewer-permissions.json when it is missing", () => {
+    const tool = toolCopy("status-missing-");
+    rmSync(join(dirname(tool.path), "reviewer-permissions.json"));
+    const result = runStatus(tool);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("missing");
+    expect(result.stdout).toContain("reviewer-permissions.json");
+  });
+
+  it("does not report reviewer-permissions.json missing when it is present", () => {
+    const tool = toolCopy("status-present-");
+    const result = runStatus(tool);
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain("reviewer-permissions.json");
+  });
 });
 
 describe("review: repo read access and chunking", () => {
@@ -234,7 +304,7 @@ describe("review: repo read access and chunking", () => {
     else process.env.DIFF_REVIEW_WORKER = previousWorker;
   });
 
-  it("runs the worker in the repo root so it can read a file outside the diff (C1)", async () => {
+  it("lets the worker read a repo file outside the diff through its read rule (C1)", async () => {
     const repo = makeRepo("c1-");
     const result = await review({
       diff: `${fileSection("src/feature.js")}\n`,
@@ -242,19 +312,48 @@ describe("review: repo read access and chunking", () => {
       rules: defaultRules(),
       outDir: join(repo, ".diff-review"),
       blocking: false,
-      workdir: repo,
+      readRoot: repo,
     });
     expect(result.parsed).toMatchObject({ ok: true, verdict: "PASS" });
-    const proof = readFileSync(join(result.dir, "c1-read-proof.txt"), "utf8");
-    expect(proof).toContain(`cwd=${repo}`);
+    const chunkDir = join(result.dir, "chunks", "1");
+    const proof = readFileSync(join(chunkDir, "c1-read-proof.txt"), "utf8");
+    // The worker's cwd is its chunk directory, not the repo root.
+    expect(proof).toContain(`cwd=${chunkDir}`);
     expect(proof).toContain("read app.js=export const marker = 'from-repo';");
-    // The old spawn put cwd at the run directory; app.js is not there.
-    const oldWay = spawnSync(fakeWorker, ["-t", "600", "-d", result.dir, "prompt"], {
-      cwd: result.dir,
+    // Without the -a read rule the worker has no repository to read.
+    const oldWay = spawnSync(fakeWorker, ["-t", "600", "-d", chunkDir, "prompt"], {
+      cwd: chunkDir,
       encoding: "utf8",
-      env: { ...process.env, ECO_WORKER_LOG_DIR: result.dir },
+      env: { ...process.env, ECO_WORKER_LOG_DIR: chunkDir },
     });
     expect(oldWay.status).not.toBe(0);
+  });
+
+  it("gives the worker a read rule for the run directory when there is no repository (self-test)", async () => {
+    const previous = process.env.DIFF_REVIEW_WORKER;
+    const argsDir = mkdtempSync(join(WORK, "args-worker-"));
+    extraDirs.push(argsDir);
+    const argsWorker = join(argsDir, "args-worker.sh");
+    writeFileSync(argsWorker, ARGS_WORKER);
+    chmodSync(argsWorker, 0o755);
+    process.env.DIFF_REVIEW_WORKER = argsWorker;
+    try {
+      const outDir = mkdtempSync(join(WORK, "no-root-"));
+      extraDirs.push(outDir);
+      const result = await review({
+        diff: `${fileSection("src/feature.js")}\n`,
+        base: "main",
+        rules: defaultRules(),
+        outDir,
+        blocking: false,
+      });
+      expect(result.parsed).toMatchObject({ ok: true, verdict: "PASS" });
+      const args = readFileSync(join(result.dir, "chunks", "1", "args.txt"), "utf8").split("\n");
+      // The rule copies live in <run>/rules/, outside the chunk directory.
+      expect(args).toContain(`Read(/${resolve(result.dir)}/**)`);
+    } finally {
+      process.env.DIFF_REVIEW_WORKER = previous;
+    }
   });
 
   it("runs one worker per chunk and lists every chunk and file", async () => {
@@ -270,7 +369,7 @@ describe("review: repo read access and chunking", () => {
       rules: defaultRules(),
       outDir: join(repo, ".diff-review"),
       blocking: false,
-      workdir: repo,
+      readRoot: repo,
       maxChars: 150,
     });
     expect(result.parsed.ok).toBe(true);
@@ -299,7 +398,7 @@ describe("review: repo read access and chunking", () => {
       rules: defaultRules(),
       outDir: join(repo, ".diff-review"),
       blocking: true,
-      workdir: repo,
+      readRoot: repo,
       maxChars: 150,
     });
     // The worker says PASS, but its single chunk was too big to have been read whole.
@@ -327,7 +426,7 @@ describe("review: repo read access and chunking", () => {
         rules: defaultRules(),
         outDir: join(repo, ".diff-review"),
         blocking: false,
-        workdir: repo,
+        readRoot: repo,
         maxChars: 150,
       });
       expect(result.parsed).toMatchObject({ ok: true, verdict: "PASS" });
@@ -349,7 +448,7 @@ describe("review: repo read access and chunking", () => {
     }
   });
 
-  it("finishes a --diff-file review with the repo as the worker cwd", () => {
+  it("finishes a --diff-file review with the repo as the worker's read root", () => {
     const repo = makeRepo("cli-");
     execFileSync("git", ["branch", "origin/main", "main"], { cwd: repo });
     writeFileSync(join(repo, "change.patch"), `${fileSection("src/bad.js")}\n`);
@@ -426,6 +525,35 @@ printf '# Refused tool calls\\n- NOT ALLOWED Bash: blocked-cmd\\n' > "$out/run-$
 exit 4
 `;
 
+const TIMEOUT_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf 'x\\n' >> "$out/attempts"
+exit 124
+`;
+
+// Records its arguments, one per line, and passes.
+const ARGS_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf '%s\\n' "$@" > "$out/args.txt"
+printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
+`;
+
+// Records the permissions file it was given, then edits the repository it may
+// only read: the review must see the change and refuse the PASS.
+const REPO_WRITER_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf 'x\\n' >> "$out/attempts"
+printf '%s\\n' "\${ECO_WORKER_PERMISSIONS:-}" > "$out/permissions.txt"
+root=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-a" ]; then root="\${arg#Read(/}"; root="\${root%/\\*\\*)}"; fi
+  prev="$arg"
+done
+printf 'tampered\\n' >> "$root/app.js"
+printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
+`;
+
 const EXIT_ONE_WORKER = `#!/usr/bin/env bash
 out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
 printf 'x\\n' >> "$out/attempts"
@@ -453,13 +581,13 @@ describe("review: a blocked worker (exit 4)", () => {
       rules: defaultRules(),
       outDir: join(repo, ".diff-review"),
       blocking: false,
-      workdir: repo,
+      readRoot: repo,
     });
   }
 
   /** How many times the fake worker ran in this review. */
   function attempts(result) {
-    return readFileSync(join(result.dir, "attempts"), "utf8").trim().split("\n").length;
+    return readFileSync(join(result.dir, "chunks", "1", "attempts"), "utf8").trim().split("\n").length;
   }
 
   beforeAll(() => {
@@ -473,24 +601,35 @@ describe("review: a blocked worker (exit 4)", () => {
     else process.env.DIFF_REVIEW_WORKER = previousWorker;
   });
 
-  it("accepts exit 4 when verdict.json is valid and lists the newest refused calls", async () => {
+  it("is an ERROR on exit 4 even with a valid verdict.json, not retried, refused calls listed", async () => {
     const result = await runReview(script("blocked-ok.sh", BLOCKED_WORKER));
-    expect(result.parsed).toMatchObject({ ok: true, verdict: "FAIL" });
-    // Accepted on the first run: exit 4 with a verdict is not a failed review.
+    // A blocked review is not a review: its verdict.json is not used.
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toContain("exited 4 (blocked)");
     expect(attempts(result)).toBe(1);
     const markdown = readFileSync(result.verdictMd, "utf8");
-    expect(markdown).toContain("exit 4 (blocked): refused calls listed");
-    expect(markdown).toContain("## Untested / refused calls");
+    expect(markdown).toContain("## ERROR");
+    expect(markdown).not.toMatch(/^- verdict: (PASS|FAIL)/m);
     expect(markdown).toContain("git log --all");
     expect(markdown).toContain("gh pr view");
     // Only the newest *.blocked.md is carried.
     expect(markdown).not.toContain("old-command");
   });
 
+  it("is an ERROR when exit 4 leaves no verdict, not retried", async () => {
+    const result = await runReview(script("blocked-empty.sh", BLOCKED_NO_VERDICT_WORKER));
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toContain("exited 4 (blocked)");
+    expect(attempts(result)).toBe(1);
+    expect(readFileSync(result.verdictMd, "utf8")).toContain("## ERROR");
+  });
+
   it("reports an unreadable blocked.md instead of listing no refused calls", async () => {
     const result = await runReview(script("blocked-unreadable.sh", BLOCKED_UNREADABLE_WORKER));
-    expect(result.parsed).toMatchObject({ ok: true, verdict: "FAIL" });
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toContain("exited 4 (blocked)");
     expect(attempts(result)).toBe(1);
+    expect(JSON.parse(readFileSync(join(result.dir, "verdict.json"), "utf8")).verdict).toBe("ERROR");
     const markdown = readFileSync(result.verdictMd, "utf8");
     const section = markdown.slice(markdown.indexOf("## Untested / refused calls"));
     expect(section).not.toContain("None.");
@@ -499,20 +638,59 @@ describe("review: a blocked worker (exit 4)", () => {
 
   it("reports a blocked.md with no refused-call line instead of listing none", async () => {
     const result = await runReview(script("blocked-empty-file.sh", BLOCKED_EMPTY_FILE_WORKER));
-    expect(result.parsed).toMatchObject({ ok: true, verdict: "FAIL" });
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toContain("exited 4 (blocked)");
     expect(attempts(result)).toBe(1);
+    expect(JSON.parse(readFileSync(join(result.dir, "verdict.json"), "utf8")).verdict).toBe("ERROR");
     const markdown = readFileSync(result.verdictMd, "utf8");
     const section = markdown.slice(markdown.indexOf("## Untested / refused calls"));
     expect(section).not.toContain("None.");
     expect(section).toContain("lists no refused call");
   });
 
-  it("is an ERROR when exit 4 leaves no verdict, after retrying", async () => {
-    const result = await runReview(script("blocked-empty.sh", BLOCKED_NO_VERDICT_WORKER));
+  it("is an ERROR on exit 124 (timeout), not retried, and verdict.json says ERROR", async () => {
+    const result = await runReview(script("timeout.sh", TIMEOUT_WORKER));
     expect(result.parsed.ok).toBe(false);
-    expect(result.parsed.error).toContain("exited 4 (blocked) twice");
-    expect(attempts(result)).toBe(2);
-    expect(readFileSync(result.verdictMd, "utf8")).toContain("## ERROR");
+    expect(result.parsed.error).toMatch(/timed out \(exit 124: the \d+s limit or eco-worker's stall watchdog; its log says which\); not retried/);
+    expect(attempts(result)).toBe(1);
+    const top = JSON.parse(readFileSync(join(result.dir, "verdict.json"), "utf8"));
+    expect(top.verdict).toBe("ERROR");
+    expect(top.error).toContain("exit 124");
+  });
+
+  it("writes ERROR into the run's verdict.json on exit 4, so no reader sees a PASS", async () => {
+    const result = await runReview(script("blocked-top.sh", BLOCKED_WORKER));
+    const top = JSON.parse(readFileSync(join(result.dir, "verdict.json"), "utf8"));
+    expect(top).toMatchObject({ verdict: "ERROR", base: "main", findings: [] });
+    expect(top.error).toContain("exited 4 (blocked)");
+  });
+
+  it("is an ERROR when the worker changes the repository, and runs it under the reviewer permissions", async () => {
+    const result = await runReview(script("repo-writer.sh", REPO_WRITER_WORKER));
+    expect(readFileSync(join(result.dir, "chunks", "1", "permissions.txt"), "utf8").trim()).toBe(REVIEWER_PERMISSIONS);
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toContain("the reviewer changed the repository");
+    expect(JSON.parse(readFileSync(join(result.dir, "verdict.json"), "utf8")).verdict).toBe("ERROR");
+  });
+
+  it("is an ERROR, with no worker run, when the repository state cannot be recorded first", async () => {
+    process.env.DIFF_REVIEW_WORKER = script("never.sh", REPO_WRITER_WORKER);
+    // WORK sits inside this repo, so a broken .git link is what makes git fail here.
+    const notRepo = mkdtempSync(join(WORK, "not-repo-"));
+    extraDirs.push(notRepo);
+    writeFileSync(join(notRepo, ".git"), "gitdir: ./missing\n");
+    const result = await review({
+      diff: `${fileSection("src/bad.js")}\n`,
+      base: "main",
+      rules: defaultRules(),
+      outDir: join(notRepo, ".diff-review"),
+      blocking: false,
+      readRoot: notRepo,
+    });
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toContain("could not record the repository state");
+    expect(existsSync(join(result.dir, "chunks", "1", "attempts"))).toBe(false);
+    expect(JSON.parse(readFileSync(join(result.dir, "verdict.json"), "utf8")).verdict).toBe("ERROR");
   });
 
   it("is an ERROR on exit 1, after retrying", async () => {
@@ -559,7 +737,7 @@ describe("review: unreadable worker logs", () => {
       rules: defaultRules(),
       outDir: join(repo, ".diff-review"),
       blocking: false,
-      workdir: repo,
+      readRoot: repo,
       ...(maxChars === undefined ? {} : { maxChars }),
     });
   }
@@ -655,11 +833,8 @@ describe("review: quota guards", () => {
   }
 
   function attemptsIn(result, chunk) {
-    // A single-chunk review keeps its files in the run directory, not chunks/<n>.
     const path = join(result.dir, "chunks", String(chunk), "attempts");
-    const single = join(result.dir, "attempts");
-    const attempts = existsSync(path) ? path : existsSync(single) ? single : null;
-    return attempts === null ? 0 : readFileSync(attempts, "utf8").trim().split("\n").length;
+    return existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").length : 0;
   }
 
   function threeFiles() {
@@ -689,7 +864,7 @@ describe("review: quota guards", () => {
         rules: defaultRules(),
         outDir: join(repo, ".diff-review"),
         blocking: false,
-        workdir: repo,
+        readRoot: repo,
         maxChars: 150,
       });
       expect(result.parsed.ok).toBe(false);
@@ -717,7 +892,7 @@ describe("review: quota guards", () => {
       rules: defaultRules(),
       outDir: join(repo, ".diff-review"),
       blocking: false,
-      workdir: repo,
+      readRoot: repo,
     });
     expect(result.parsed.ok).toBe(false);
     expect(result.parsed.error).toContain("turn cap");
@@ -734,7 +909,7 @@ describe("review: quota guards", () => {
       rules: defaultRules(),
       outDir: join(repo, ".diff-review"),
       blocking: false,
-      workdir: repo,
+      readRoot: repo,
     });
     expect(result.parsed).toMatchObject({ ok: true, verdict: "PASS" });
     expect(readFileSync(result.verdictMd, "utf8")).toContain("turn cap reached, but verdict.json is valid");
@@ -759,7 +934,7 @@ describe("review: quota guards", () => {
         rules: defaultRules(),
         outDir: join(repo, ".diff-review"),
         blocking: false,
-        workdir: repo,
+        readRoot: repo,
         ...extra,
       });
     }
@@ -807,9 +982,9 @@ describe("review: quota guards", () => {
         rules: defaultRules(),
         outDir: join(repo, ".diff-review"),
         blocking: false,
-        workdir: repo,
+        readRoot: repo,
       });
-      expect(readFileSync(join(result.dir, "env.txt"), "utf8").trim().split("\n")).toEqual(["41", "1"]);
+      expect(readFileSync(join(result.dir, "chunks", "1", "env.txt"), "utf8").trim().split("\n")).toEqual(["41", "1"]);
 
       process.env.DIFF_REVIEW_MAX_TURNS = "7";
       process.env.ECO_WORKER_NO_RETRY_429 = "0";
@@ -819,9 +994,9 @@ describe("review: quota guards", () => {
         rules: defaultRules(),
         outDir: join(repo, ".diff-review"),
         blocking: false,
-        workdir: repo,
+        readRoot: repo,
       });
-      expect(readFileSync(join(result.dir, "env.txt"), "utf8").trim().split("\n")).toEqual(["7", "0"]);
+      expect(readFileSync(join(result.dir, "chunks", "1", "env.txt"), "utf8").trim().split("\n")).toEqual(["7", "0"]);
     } finally {
       if (previousTurns === undefined) delete process.env.DIFF_REVIEW_MAX_TURNS;
       else process.env.DIFF_REVIEW_MAX_TURNS = previousTurns;
@@ -997,7 +1172,7 @@ printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.
     expect(markdown).toContain("- old.js");
     // The reviewer saw only the delta; the unchanged file is not in its prompt.
     const prompt = readFileSync(
-      join(repo, ".diff-review", readdirSync(join(repo, ".diff-review")).filter((n) => n !== ".gitignore").sort().pop(), "prompt.txt"),
+      join(repo, ".diff-review", readdirSync(join(repo, ".diff-review")).filter((n) => n !== ".gitignore").sort().pop(), "chunks", "1", "prompt.txt"),
       "utf8",
     );
     expect(prompt).toContain("delta review since");
@@ -1095,5 +1270,74 @@ printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.
     expect(markdown).toContain("- `old.js:4` No stubs\n");
     expect(markdown).not.toContain("carried from the earlier verdict");
     expect(markdown).not.toContain("No stubs — ");
+  });
+});
+
+describe("repoState", () => {
+  it("changes when an already-modified or an untracked file is edited again", () => {
+    const repo = makeRepo("state-");
+    writeFileSync(join(repo, "app.js"), "export const marker = 'edited-once';\n");
+    writeFileSync(join(repo, "notes.txt"), "first\n");
+    const before = repoState(repo);
+    expect(before.ok).toBe(true);
+    // git status stays " M app.js" and "?? notes.txt"; only the contents move.
+    writeFileSync(join(repo, "app.js"), "export const marker = 'edited-twice';\n");
+    const afterTracked = repoState(repo);
+    expect(afterTracked.ok).toBe(true);
+    expect(afterTracked.state).not.toBe(before.state);
+    writeFileSync(join(repo, "notes.txt"), "second\n");
+    const afterUntracked = repoState(repo);
+    expect(afterUntracked.state).not.toBe(afterTracked.state);
+    expect(repoState(repo).state).toBe(afterUntracked.state);
+  });
+
+  it("records an untracked symlink to a directory by its target instead of failing", () => {
+    const repo = makeRepo("state-link-");
+    mkdirSync(join(repo, "real"));
+    symlinkSync("real", join(repo, "link"));
+    const before = repoState(repo);
+    expect(before.ok).toBe(true);
+    rmSync(join(repo, "link"));
+    symlinkSync("elsewhere", join(repo, "link"));
+    expect(repoState(repo).state).not.toBe(before.state);
+  });
+
+  it("records an untracked nested repository by name instead of failing", () => {
+    const repo = makeRepo("state-nested-");
+    mkdirSync(join(repo, "inner"));
+    execFileSync("git", ["init", "-q"], { cwd: join(repo, "inner") });
+    writeFileSync(join(repo, "inner", "a.txt"), "a\n");
+    const before = repoState(repo);
+    expect(before.ok).toBe(true);
+    expect(before.state).toContain("?? inner/");
+  });
+
+  it("is not ok where git cannot read the repository", () => {
+    const notRepo = mkdtempSync(join(WORK, "state-none-"));
+    extraDirs.push(notRepo);
+    writeFileSync(join(notRepo, ".git"), "gitdir: ./missing\n");
+    expect(repoState(notRepo).ok).toBe(false);
+  });
+});
+
+describe("loadReviewerCommands", () => {
+  it("lists the shipped file's commands", () => {
+    const loaded = loadReviewerCommands();
+    expect(loaded.ok).toBe(true);
+    expect(loaded.commands).toContain("git diff");
+  });
+
+  it("is not ok for a missing, unparsable or allow-less permissions file", () => {
+    const dir = mkdtempSync(join(WORK, "perms-"));
+    extraDirs.push(dir);
+    const missing = loadReviewerCommands(join(dir, "missing.json"));
+    expect(missing.ok).toBe(false);
+    expect(missing.error).toContain("could not read");
+    writeFileSync(join(dir, "broken.json"), "{");
+    expect(loadReviewerCommands(join(dir, "broken.json")).ok).toBe(false);
+    writeFileSync(join(dir, "empty.json"), "{}");
+    const empty = loadReviewerCommands(join(dir, "empty.json"));
+    expect(empty.ok).toBe(false);
+    expect(empty.error).toContain("no permissions.allow list");
   });
 });
