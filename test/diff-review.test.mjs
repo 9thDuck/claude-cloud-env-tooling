@@ -12,6 +12,7 @@ import {
 import { join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { workerTimeoutSeconds } from "../diff-review/diff-review-lib.mjs";
 import {
   FIXTURES,
   collectDiff,
@@ -73,6 +74,14 @@ if printf '%s' "$prompt" | grep -q 'src/bad.js'; then
 else
   printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
 fi
+`;
+
+// Records the -t value it was called with, next to a valid verdict.
+const RECORDING_WORKER = `#!/usr/bin/env bash
+set -euo pipefail
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf '%s\\n' "$2" > "$out/timeout.txt"
+printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
 `;
 
 beforeAll(() => {
@@ -214,9 +223,9 @@ describe("review: repo read access and chunking", () => {
     else process.env.DIFF_REVIEW_WORKER = previousWorker;
   });
 
-  it("runs the worker in the repo root so it can read a file outside the diff (C1)", () => {
+  it("runs the worker in the repo root so it can read a file outside the diff (C1)", async () => {
     const repo = makeRepo("c1-");
-    const result = review({
+    const result = await review({
       diff: `${fileSection("src/feature.js")}\n`,
       base: "main",
       rules: defaultRules(),
@@ -237,14 +246,14 @@ describe("review: repo read access and chunking", () => {
     expect(oldWay.status).not.toBe(0);
   });
 
-  it("runs one worker per chunk and lists every chunk and file", () => {
+  it("runs one worker per chunk and lists every chunk and file", async () => {
     const repo = makeRepo("chunks-");
     const diff = [
       fileSection("src/bad.js"),
       fileSection("src/good.js"),
       fileSection("docs/guide.md"),
     ].join("\n");
-    const result = review({
+    const result = await review({
       diff,
       base: "main",
       rules: defaultRules(),
@@ -267,11 +276,11 @@ describe("review: repo read access and chunking", () => {
     expect(markdown).not.toContain("not covered");
   });
 
-  it("is an ERROR when a hunk is larger than the chunk limit (F2)", () => {
+  it("is an ERROR when a hunk is larger than the chunk limit (F2)", async () => {
     const repo = makeRepo("oversize-");
     const added = Array.from({ length: 40 }, (_, index) => `+const value${index} = ${index};`).join("\n");
     const diff = `${fileSection("src/feature.js", [`@@ -0,0 +1,40 @@\n${added}`])}\n`;
-    const result = review({
+    const result = await review({
       diff,
       base: "main",
       rules: defaultRules(),
@@ -284,6 +293,47 @@ describe("review: repo read access and chunking", () => {
     expect(result.parsed).toMatchObject({ ok: true, verdict: "PASS" });
     expect(result.decision.exitCode).toBe(1);
     expect(result.decision.line).toContain("ERROR");
+  });
+
+  it("gives each worker run a timeout scaled to its chunk size", async () => {
+    const repo = makeRepo("timeout-");
+    const workerDir = mkdtempSync(join(WORK, "recording-worker-"));
+    extraDirs.push(workerDir);
+    const worker = join(workerDir, "recording-worker.sh");
+    writeFileSync(worker, RECORDING_WORKER);
+    chmodSync(worker, 0o755);
+    const previousWorker = process.env.DIFF_REVIEW_WORKER;
+    const previousTimeout = process.env.DIFF_REVIEW_TIMEOUT_SECONDS;
+    process.env.DIFF_REVIEW_WORKER = worker;
+    delete process.env.DIFF_REVIEW_TIMEOUT_SECONDS;
+    try {
+      const diff = [fileSection("src/a.js"), fileSection("src/b.js"), fileSection("src/c.js")].join("\n");
+      const result = await review({
+        diff,
+        base: "main",
+        rules: defaultRules(),
+        outDir: join(repo, ".diff-review"),
+        blocking: false,
+        workdir: repo,
+        maxChars: 150,
+      });
+      expect(result.parsed).toMatchObject({ ok: true, verdict: "PASS" });
+      const chunkDirs = readdirSync(join(result.dir, "chunks"));
+      expect(chunkDirs.length).toBeGreaterThan(1);
+      for (const name of chunkDirs) {
+        const chunkDir = join(result.dir, "chunks", name);
+        const chars = readFileSync(join(chunkDir, "diff.patch"), "utf8").length;
+        // The old fixed -t 600 is now too short even for a small chunk.
+        expect(Number(readFileSync(join(chunkDir, "timeout.txt"), "utf8").trim())).toBe(
+          workerTimeoutSeconds(chars),
+        );
+      }
+    } finally {
+      if (previousWorker === undefined) delete process.env.DIFF_REVIEW_WORKER;
+      else process.env.DIFF_REVIEW_WORKER = previousWorker;
+      if (previousTimeout === undefined) delete process.env.DIFF_REVIEW_TIMEOUT_SECONDS;
+      else process.env.DIFF_REVIEW_TIMEOUT_SECONDS = previousTimeout;
+    }
   });
 
   it("finishes a --diff-file review with the repo as the worker cwd", () => {
@@ -367,10 +417,10 @@ describe("review: a blocked worker (exit 4)", () => {
     return path;
   }
 
-  function runReview(worker) {
+  async function runReview(worker) {
     process.env.DIFF_REVIEW_WORKER = worker;
     const repo = makeRepo("blocked-");
-    return review({
+    return await review({
       diff: `${fileSection("src/bad.js")}\n`,
       base: "main",
       rules: defaultRules(),
@@ -396,8 +446,8 @@ describe("review: a blocked worker (exit 4)", () => {
     else process.env.DIFF_REVIEW_WORKER = previousWorker;
   });
 
-  it("accepts exit 4 when verdict.json is valid and lists the newest refused calls", () => {
-    const result = runReview(script("blocked-ok.sh", BLOCKED_WORKER));
+  it("accepts exit 4 when verdict.json is valid and lists the newest refused calls", async () => {
+    const result = await runReview(script("blocked-ok.sh", BLOCKED_WORKER));
     expect(result.parsed).toMatchObject({ ok: true, verdict: "FAIL" });
     // Accepted on the first run: exit 4 with a verdict is not a failed review.
     expect(attempts(result)).toBe(1);
@@ -410,8 +460,8 @@ describe("review: a blocked worker (exit 4)", () => {
     expect(markdown).not.toContain("old-command");
   });
 
-  it("reports an unreadable blocked.md instead of listing no refused calls", () => {
-    const result = runReview(script("blocked-unreadable.sh", BLOCKED_UNREADABLE_WORKER));
+  it("reports an unreadable blocked.md instead of listing no refused calls", async () => {
+    const result = await runReview(script("blocked-unreadable.sh", BLOCKED_UNREADABLE_WORKER));
     expect(result.parsed).toMatchObject({ ok: true, verdict: "FAIL" });
     expect(attempts(result)).toBe(1);
     const markdown = readFileSync(result.verdictMd, "utf8");
@@ -420,8 +470,8 @@ describe("review: a blocked worker (exit 4)", () => {
     expect(section).toContain("could not read");
   });
 
-  it("reports a blocked.md with no refused-call line instead of listing none", () => {
-    const result = runReview(script("blocked-empty-file.sh", BLOCKED_EMPTY_FILE_WORKER));
+  it("reports a blocked.md with no refused-call line instead of listing none", async () => {
+    const result = await runReview(script("blocked-empty-file.sh", BLOCKED_EMPTY_FILE_WORKER));
     expect(result.parsed).toMatchObject({ ok: true, verdict: "FAIL" });
     expect(attempts(result)).toBe(1);
     const markdown = readFileSync(result.verdictMd, "utf8");
@@ -430,16 +480,16 @@ describe("review: a blocked worker (exit 4)", () => {
     expect(section).toContain("lists no refused call");
   });
 
-  it("is an ERROR when exit 4 leaves no verdict, after retrying", () => {
-    const result = runReview(script("blocked-empty.sh", BLOCKED_NO_VERDICT_WORKER));
+  it("is an ERROR when exit 4 leaves no verdict, after retrying", async () => {
+    const result = await runReview(script("blocked-empty.sh", BLOCKED_NO_VERDICT_WORKER));
     expect(result.parsed.ok).toBe(false);
     expect(result.parsed.error).toContain("exited 4 (blocked) twice");
     expect(attempts(result)).toBe(2);
     expect(readFileSync(result.verdictMd, "utf8")).toContain("## ERROR");
   });
 
-  it("is an ERROR on exit 1, after retrying", () => {
-    const result = runReview(script("exit-one.sh", EXIT_ONE_WORKER));
+  it("is an ERROR on exit 1, after retrying", async () => {
+    const result = await runReview(script("exit-one.sh", EXIT_ONE_WORKER));
     expect(result.parsed.ok).toBe(false);
     expect(result.parsed.error).toContain("exited 1 twice");
     expect(attempts(result)).toBe(2);

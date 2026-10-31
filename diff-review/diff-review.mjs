@@ -20,7 +20,7 @@
  * in both modes, so a broken review never looks green. The review is a second
  * reader, never acceptance.
  */
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -39,26 +39,28 @@ import { fileURLToPath } from "node:url";
 import {
   CONFIG_FILE,
   DECIDED_COPY,
-  MAX_DIFF_CHARS,
+  DIFF_REVIEW_CHUNK_CHARS,
   blockingFromEnv,
   buildPrompt,
+  concurrencyFromEnv,
   coverageProblems,
   decide,
   mergeVerdicts,
   parseConfig,
   parseVerdict,
   ruleCopies,
+  runPool,
   runsToPrune,
   splitDiff,
+  workerTimeoutSeconds,
 } from "./diff-review-lib.mjs";
 
 const TOOL_DIR = dirname(fileURLToPath(import.meta.url));
 export const FIXTURES = join(TOOL_DIR, "fixtures");
 export const FIXTURE_FILES = ["bad.patch", "good.patch"];
 export const DEFAULT_RULES = join(TOOL_DIR, "rules", "default-rules.md");
-// A lockfile regen must reach MAX_DIFF_CHARS, not die on Node's 1 MiB default.
+// A lockfile regen must reach the chunk target, not die on Node's 1 MiB default.
 const GIT_MAX_BUFFER = 256 * 1024 * 1024;
-const TIMEOUT_SECONDS = "600";
 
 /**
  * Where the self-test keeps its record and runs; outside any repo, so it works anywhere.
@@ -274,6 +276,28 @@ function refusedCalls(logDir) {
 }
 
 /**
+ * Spawn the worker and settle when it closes. `error` (the command could not
+ * start) and `close` both end the run; whichever comes first wins.
+ * @param {string} worker
+ * @param {string[]} args
+ * @param {import("node:child_process").SpawnOptions} options
+ * @returns {Promise<{ status: number | null, signal: string | null } | { error: Error }>}
+ */
+function spawnWorker(worker, args, options) {
+  return new Promise((settle) => {
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      settle(result);
+    };
+    const child = spawn(worker, args, options);
+    child.on("error", (error) => finish({ error }));
+    child.on("close", (status, signal) => finish({ status, signal }));
+  });
+}
+
+/**
  * Run the worker once, retrying once on a non-zero exit.
  *
  * The worker's working directory is the repository root, so Read/Grep/Glob and
@@ -281,26 +305,29 @@ function refusedCalls(logDir) {
  * through eco-worker's ECO_WORKER_LOG_DIR, and its verdict is written to the
  * absolute `verdictPath` given in the prompt.
  *
+ * Chunk workers run concurrently (see runPool), so this is async: the run
+ * completes on the child's close event rather than blocking the event loop.
+ *
  * Exit 4 means eco-worker was blocked because at least one optional Bash call
  * was refused. When the leg still wrote a parseable verdict.json the review is
  * usable, so it is accepted without a retry and the refusals are reported.
  * Exit 4 without a valid verdict, and every other non-zero exit, is retried and
- * then reported as an ERROR.
- * @param {{ workdir: string, logDir: string, verdictPath: string, prompt: string }} options
- * @returns {{ ok: true, blocked: boolean, retried: boolean } | { ok: false, error: string, retried: boolean }}
+ * then reported as an ERROR. `timeoutSeconds` scales with the chunk size: the
+ * reviewer reads the repository, so a bigger chunk needs longer.
+ * @param {{ workdir: string, logDir: string, verdictPath: string, prompt: string, timeoutSeconds: number }} options
+ * @returns {Promise<{ ok: true, blocked: boolean, retried: boolean } | { ok: false, error: string, retried: boolean }>}
  */
-function runWorker({ workdir, logDir, verdictPath, prompt }) {
+async function runWorker({ workdir, logDir, verdictPath, prompt, timeoutSeconds }) {
   const worker = workerCommand();
-  let lastStatus = null;
+  let lastFailure = null;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     // A retry must never read the previous attempt's verdict.
     rmSync(verdictPath, { force: true });
     console.log(
-      `[diff-review] worker attempt ${attempt}/2 (workdir ${workdir}, logs ${logDir})`,
+      `[diff-review] worker attempt ${attempt}/2 (workdir ${workdir}, logs ${logDir}, timeout ${timeoutSeconds}s)`,
     );
-    const result = spawnSync(worker, ["-t", TIMEOUT_SECONDS, "-d", workdir, prompt], {
+    const result = await spawnWorker(worker, ["-t", String(timeoutSeconds), "-d", workdir, prompt], {
       cwd: workdir,
-      encoding: "utf8",
       stdio: "inherit",
       env: { ...process.env, ECO_WORKER_LOG_DIR: logDir },
     });
@@ -311,17 +338,17 @@ function runWorker({ workdir, logDir, verdictPath, prompt }) {
         retried: attempt > 1,
       };
     if (result.status === 0) return { ok: true, blocked: false, retried: attempt > 1 };
-    lastStatus = result.status;
+    lastFailure = result.status === null ? `was killed by ${result.signal}` : `exited ${result.status}`;
     // A blocked leg that still wrote its verdict reviewed the chunk; accept it.
     if (result.status === 4 && readVerdictFile(verdictPath)?.ok === true)
       return { ok: true, blocked: true, retried: attempt > 1 };
     // Loud: a failed reviewer run is a failed review, never a quiet PASS.
-    console.error(`[diff-review] FAILED: worker exited ${result.status} on attempt ${attempt}/2`);
+    console.error(`[diff-review] FAILED: worker ${lastFailure} on attempt ${attempt}/2`);
   }
   const error =
-    lastStatus === 4
+    lastFailure === "exited 4"
       ? "the worker exited 4 (blocked) twice without a valid verdict.json"
-      : `the worker exited ${lastStatus} twice`;
+      : `the worker ${lastFailure} twice`;
   return { ok: false, error, retried: true };
 }
 
@@ -366,17 +393,21 @@ function readChunkVerdict(verdictPath, run, logDir) {
 /**
  * Review one diff and leave the evidence on disk.
  *
- * A diff over MAX_DIFF_CHARS is split into chunks (splitDiff); each chunk gets
- * its own worker run in `<run>/chunks/<n>/`, with the repository root as the
- * worker's working directory so it can read the code the diff talks about. The
- * verdicts are merged (any chunk ERROR => ERROR, else any FAIL => FAIL), and a
- * chunk set that does not cover every file in the diff is an ERROR.
+ * A diff over DIFF_REVIEW_CHUNK_CHARS is split into chunks (splitDiff); each
+ * chunk gets its own worker run in `<run>/chunks/<n>/`, with the repository root
+ * as the worker's working directory so it can read the code the diff talks
+ * about. Each run's timeout scales with its chunk size (workerTimeoutSeconds).
+ * Chunk workers run concurrently, at most DIFF_REVIEW_CONCURRENCY (default 4,
+ * minimum 1) at a time; results are merged in chunk order regardless of which
+ * worker finished first. The verdicts are merged (any chunk ERROR => ERROR, else
+ * any FAIL => FAIL), and a chunk set that does not cover every file in the diff
+ * is an ERROR.
  * @param {{ diff: string, base: string, rules: ReturnType<typeof loadRules>, outDir: string, label?: string, blocking: boolean, workdir?: string, maxChars?: number }} options
  *   `outDir` holds one directory per run; the oldest are pruned. `workdir` is
  *   the repository root (defaults to `outDir` for the self-test).
- * @returns {{ parsed: ReturnType<typeof parseVerdict>, decision: ReturnType<typeof decide>, dir: string, verdictMd: string }}
+ * @returns {Promise<{ parsed: ReturnType<typeof parseVerdict>, decision: ReturnType<typeof decide>, dir: string, verdictMd: string }>}
  */
-export function review({
+export async function review({
   diff,
   base,
   rules,
@@ -384,7 +415,7 @@ export function review({
   label = "",
   blocking,
   workdir = null,
-  maxChars = MAX_DIFF_CHARS,
+  maxChars = DIFF_REVIEW_CHUNK_CHARS,
 }) {
   const runsDir = resolve(outDir);
   mkdirSync(runsDir, { recursive: true });
@@ -440,8 +471,12 @@ export function review({
     // Nothing may be silently dropped.
     parsed = { ok: false, error: `diff coverage is incomplete: ${coverage.join("; ")}` };
   } else {
-    const results = [];
-    for (const row of chunkRows) {
+    const concurrency = concurrencyFromEnv();
+    console.log(
+      `[diff-review] reviewing ${chunkRows.length} chunk(s), ${concurrency} at a time`,
+    );
+    // runPool keeps the results in chunk order even when later chunks finish first.
+    const results = await runPool(chunkRows, concurrency, async (row) => {
       mkdirSync(row.dir, { recursive: true });
       const chunkPatch = resolve(join(row.dir, "diff.patch"));
       if (split.chunks.length > 1) writeFileSync(chunkPatch, row.chunk.text);
@@ -461,18 +496,19 @@ export function review({
         workdir: runWorkdir,
       });
       writeFileSync(join(row.dir, "prompt.md"), prompt);
-      const run = runWorker({
+      const run = await runWorker({
         workdir: runWorkdir,
         logDir: row.dir,
         verdictPath,
         prompt,
+        timeoutSeconds: workerTimeoutSeconds(row.chars),
       });
       const verdict = readChunkVerdict(verdictPath, run, row.dir);
       row.parsed = verdict.parsed;
       row.workerNote = verdict.workerNote;
       row.refused = verdict.refused;
-      results.push({ index: row.index, parsed: verdict.parsed });
-    }
+      return { index: row.index, parsed: verdict.parsed };
+    });
     parsed = mergeVerdicts(results);
   }
 
@@ -655,9 +691,9 @@ function setupError(error) {
 /**
  * Prove the reviewer can fail: bad.patch must be FAIL with a finding, good.patch PASS.
  * Uses the bundled rules and runs advisory on purpose; it asserts the verdicts itself.
- * @returns {number} exit code
+ * @returns {Promise<number>} exit code
  */
-function selfTest() {
+async function selfTest() {
   const state = stateDir();
   const rows = [];
   let pass = true;
@@ -675,7 +711,7 @@ function selfTest() {
       pass = false;
       continue;
     }
-    const result = review({
+    const result = await review({
       diff: patch.diff,
       base: "(self-test fixture)",
       rules: defaultRules(),
@@ -807,9 +843,9 @@ Advisory by default; DIFF_REVIEW_BLOCKING=1 makes a FAIL exit 1. See README.md.`
 /**
  * The CLI.
  * @param {string[]} argv
- * @returns {number} exit code
+ * @returns {Promise<number>} exit code
  */
-function main(argv) {
+async function main(argv) {
   const options = parseArgs(argv);
   if ("error" in options) {
     console.error(`diff-review: ERROR ${options.error}\n${USAGE}`);
@@ -820,7 +856,7 @@ function main(argv) {
     return 0;
   }
   if (options.mode === "status") return status();
-  if (options.mode === "self-test") return selfTest();
+  if (options.mode === "self-test") return await selfTest();
   const top = repoRoot();
   if (!top.ok) return setupError(top.error);
   const collected =
@@ -832,7 +868,7 @@ function main(argv) {
   }
   const mergeBase = mergeBaseOf(top.root, options.base);
   const rules = mergeBase.ok ? loadRules(top.root, mergeBase.sha) : mergeBase;
-  const result = review({
+  const result = await review({
     diff: collected.diff,
     base: options.base,
     rules,
@@ -845,5 +881,11 @@ function main(argv) {
 }
 
 if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  process.exit(main(process.argv.slice(2)));
+  main(process.argv.slice(2)).then(
+    (code) => process.exit(code),
+    (error) => {
+      console.error(`diff-review: ERROR ${error?.stack ?? error}`);
+      process.exit(1);
+    },
+  );
 }
