@@ -814,6 +814,29 @@ export function allowedBashCommands(permissions) {
   });
 }
 
+/**
+ * The reviewer's permissions for one run: a `-C <root>` twin of every
+ * `Bash(git ...)` allow rule, so the reviewer (whose cwd is its chunk's run
+ * directory, not the repo root) can run read-only git against the repository
+ * under review. Only that root and only allow-listed subcommands get a twin,
+ * so any other -C path or a write subcommand is refused. Deny rules are
+ * copied; the input is not mutated.
+ * @param {{ permissions?: { allow?: unknown[], deny?: unknown[] } }} permissions parsed permissions JSON.
+ * @param {string} root the repository root under review.
+ * @returns {Record<string, any>} a new permissions object.
+ */
+export function reviewerPermissionsFor(permissions, root) {
+  const source = permissions?.permissions ?? {};
+  const allow = Array.isArray(source.allow) ? source.allow : [];
+  const twins = allow.flatMap((rule) =>
+    typeof rule === "string" && rule.startsWith("Bash(git ")
+      ? [`Bash(git -C ${root} ${rule.slice("Bash(git ".length)}`]
+      : [],
+  );
+  const merged = { ...source, allow: [...allow, ...twins], deny: [...(source.deny ?? [])] };
+  return { ...permissions, permissions: merged };
+}
+
 /** Where the reviewer finds its copy of the decided-items file. */
 export const DECIDED_COPY = "./decided.md";
 

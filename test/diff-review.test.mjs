@@ -66,26 +66,18 @@ function fileSection(path, hunks = ["@@ -1 +1 @@\n-a\n+b"]) {
   ].join("\n");
 }
 
-/**
- * Whether a Claude Code Bash permission rule matches a command: `Bash(p:*)`
- * matches a command equal to p or starting with `p `; `Bash(p)` matches only
- * exactly p.
- */
+// Claude Code Bash rules: `Bash(p:*)` matches p or a command starting with "p ",
+// `Bash(p)` only p; a deny match refuses, else an allow match allows.
 function bashRuleMatches(rule, command) {
-  const match = /^Bash\((.+)\)$/.exec(rule);
-  if (match === null) return false;
-  const body = match[1];
-  if (!body.endsWith(":*")) return command === body;
-  const prefix = body.slice(0, -":*".length);
-  return command === prefix || command.startsWith(`${prefix} `);
+  const body = /^Bash\((.+)\)$/.exec(rule)?.[1];
+  if (body === undefined) return false;
+  const prefix = body.endsWith(":*") ? body.slice(0, -2) : null;
+  return prefix === null ? command === body : command === prefix || command.startsWith(`${prefix} `);
 }
 
-/** Claude Code's decision: any matching deny refuses, else any matching allow allows, else refused. */
-function commandAllowed(permissions, command) {
-  const { allow = [], deny = [] } = permissions.permissions ?? {};
-  if (deny.some((rule) => bashRuleMatches(rule, command))) return false;
-  return allow.some((rule) => bashRuleMatches(rule, command));
-}
+const commandAllowed = (permissions, command) =>
+  !(permissions.permissions?.deny ?? []).some((rule) => bashRuleMatches(rule, command)) &&
+  (permissions.permissions?.allow ?? []).some((rule) => bashRuleMatches(rule, command));
 
 // Proves what the worker may read: it reads app.js, a repo file outside the
 // diff, from the root its -a "Read(/<root>/**)" rule grants, and writes its
@@ -654,18 +646,12 @@ printf 'tampered\\n' >> "$root/app.js"
 printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
 `;
 
-// Records the permissions file it was given and the repository root its -a rule
-// grants, then passes without touching the repository.
+// Records the permissions file and the -a rule's root, then passes untouched.
 const PERMISSIONS_READER_WORKER = `#!/usr/bin/env bash
 out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
 printf '%s\\n' "\${ECO_WORKER_PERMISSIONS:-}" > "$out/permissions-path.txt"
-root=""
-prev=""
-for arg in "$@"; do
-  if [ "$prev" = "-a" ]; then root="\${arg#Read(/}"; root="\${root%/\\*\\*)}"; fi
-  prev="$arg"
-done
-printf '%s\\n' "$root" > "$out/root.txt"
+for arg in "$@"; do [ "$prev" != "-a" ] || root="\${arg#Read(/}"; prev="$arg"; done
+printf '%s\\n' "\${root%/\\*\\*)}" > "$out/root.txt"
 printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
 `;
 
@@ -820,46 +806,34 @@ describe("review: a blocked worker (exit 4)", () => {
 });
 
 describe("reviewer git -C rules", () => {
-  let scriptsDir;
-  let previousWorker;
-
-  beforeAll(() => {
-    scriptsDir = mkdtempSync(join(WORK, "git-c-workers-"));
-    extraDirs.push(scriptsDir);
-    previousWorker = process.env.DIFF_REVIEW_WORKER;
-  });
-
-  afterAll(() => {
-    if (previousWorker === undefined) delete process.env.DIFF_REVIEW_WORKER;
-    else process.env.DIFF_REVIEW_WORKER = previousWorker;
-  });
-
   it("allows read-only git -C on the repository under review and refuses every other -C", async () => {
-    const path = join(scriptsDir, "permissions-reader.sh");
-    writeFileSync(path, PERMISSIONS_READER_WORKER);
-    chmodSync(path, 0o755);
-    process.env.DIFF_REVIEW_WORKER = path;
-    const repo = makeRepo("git-c-");
-    const result = await review({
-      diff: `${fileSection("src/bad.js")}\n`,
-      base: "main",
-      rules: defaultRules(),
-      outDir: join(repo, ".diff-review"),
-      blocking: false,
-      readRoot: repo,
-    });
-    expect(result.parsed.ok).toBe(true);
-    const chunkDir = join(result.dir, "chunks", "1");
-    const permissions = JSON.parse(
-      readFileSync(readFileSync(join(chunkDir, "permissions-path.txt"), "utf8").trim(), "utf8"),
-    );
-    const root = readFileSync(join(chunkDir, "root.txt"), "utf8").trim();
-    expect(root).toBe(repo);
-    expect(commandAllowed(permissions, `git -C ${root} log --oneline -1 -- app.js`)).toBe(true);
-    expect(commandAllowed(permissions, "git -C /some/other/path log --oneline -1")).toBe(false);
-    expect(commandAllowed(permissions, `git -C ${root} push origin HEAD`)).toBe(false);
-    expect(commandAllowed(permissions, `git -C ${root}-evil log --oneline -1`)).toBe(false);
-    expect(commandAllowed(permissions, `git -C ${root}/../x log --oneline -1`)).toBe(false);
+    const previousWorker = process.env.DIFF_REVIEW_WORKER;
+    const scriptsDir = mkdtempSync(join(WORK, "git-c-workers-"));
+    extraDirs.push(scriptsDir);
+    process.env.DIFF_REVIEW_WORKER = join(scriptsDir, "permissions-reader.sh");
+    writeFileSync(process.env.DIFF_REVIEW_WORKER, PERMISSIONS_READER_WORKER);
+    chmodSync(process.env.DIFF_REVIEW_WORKER, 0o755);
+    try {
+      const repo = makeRepo("git-c-");
+      const result = await review({
+        diff: `${fileSection("src/bad.js")}\n`,
+        base: "main",
+        rules: defaultRules(),
+        outDir: join(repo, ".diff-review"),
+        readRoot: repo,
+      });
+      const read = (name) => readFileSync(join(result.dir, "chunks", "1", name), "utf8").trim();
+      const permissions = JSON.parse(readFileSync(read("permissions-path.txt"), "utf8"));
+      const root = read("root.txt");
+      expect(commandAllowed(permissions, `git -C ${root} log --oneline -1 -- app.js`)).toBe(true);
+      expect(commandAllowed(permissions, "git -C /some/other/path log --oneline -1")).toBe(false);
+      expect(commandAllowed(permissions, `git -C ${root} push origin HEAD`)).toBe(false);
+      expect(commandAllowed(permissions, `git -C ${root}-evil log --oneline -1`)).toBe(false);
+      expect(commandAllowed(permissions, `git -C ${root}/../x log --oneline -1`)).toBe(false);
+    } finally {
+      if (previousWorker === undefined) delete process.env.DIFF_REVIEW_WORKER;
+      else process.env.DIFF_REVIEW_WORKER = previousWorker;
+    }
   });
 });
 

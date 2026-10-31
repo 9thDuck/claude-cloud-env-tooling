@@ -33,7 +33,6 @@
     ],
     "deny": [
       "Bash(git push:*)",
-      "Bash(git -C:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
       "Bash(git checkout:*)",

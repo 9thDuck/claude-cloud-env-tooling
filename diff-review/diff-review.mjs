@@ -57,6 +57,7 @@ import {
   parseEarlierVerdict,
   parseVerdict,
   rateLimitDetail,
+  reviewerPermissionsFor,
   ruleCopies,
   runPool,
   runsToPrune,
@@ -440,6 +441,16 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
   const worker = workerCommand();
   const maxTurns = maxTurnsFor(chunkChars);
   const noRetry429 = noRetry429FromEnv();
+  // The reviewer runs in the chunk directory, so it needs a -C twin of each
+  // read-only git allow rule for readRoot only; an unreadable file is an ERROR.
+  let shipped;
+  try {
+    shipped = JSON.parse(readFileSync(REVIEWER_PERMISSIONS, "utf8"));
+  } catch (error) {
+    return { ok: false, retried: false, error: `could not read ${REVIEWER_PERMISSIONS}: ${error.message}` };
+  }
+  const permissionsPath = join(logDir, "reviewer-permissions.json");
+  writeFileSync(permissionsPath, `${JSON.stringify(reviewerPermissionsFor(shipped, readRoot), null, 2)}\n`);
   let lastFailure = null;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     // A retry must never read the previous attempt's verdict.
@@ -455,8 +466,9 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
       env: {
         ...process.env,
         ECO_WORKER_LOG_DIR: logDir,
-        // The reviewer's own read-only rule set, not the builder's permissions.json.
-        ECO_WORKER_PERMISSIONS: REVIEWER_PERMISSIONS,
+        // The reviewer's read-only rule set with git -C <readRoot> twins, not the
+        // builder's permissions.json.
+        ECO_WORKER_PERMISSIONS: permissionsPath,
         ECO_WORKER_NO_RETRY_429: noRetry429 ? "1" : "0",
         ECO_WORKER_MAX_TURNS: String(maxTurns),
       },
