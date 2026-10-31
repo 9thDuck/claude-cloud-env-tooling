@@ -45,13 +45,19 @@ import {
   concurrencyFromEnv,
   coverageProblems,
   decide,
+  deltaReview,
+  maxTurnsFromEnv,
   mergeVerdicts,
+  noRetry429FromEnv,
   parseConfig,
+  parseEarlierVerdict,
   parseVerdict,
+  rateLimitDetail,
   ruleCopies,
   runPool,
   runsToPrune,
   splitDiff,
+  turnCapDetail,
   workerTimeoutSeconds,
 } from "./diff-review-lib.mjs";
 
@@ -276,6 +282,37 @@ function refusedCalls(logDir) {
 }
 
 /**
+ * Everything the worker leg left in `logDir` that can report a rejection: the
+ * eco-worker log and status files. Unlike refusedCalls this cannot treat an
+ * unreadable file as "no rejection": a 429 in a log we cannot read must not be
+ * retried. Each unreadable path and its error are returned in `unreadable`.
+ * @param {string} logDir
+ * @returns {{ text: string, unreadable: string[] }}
+ */
+function logText(logDir) {
+  let names;
+  try {
+    names = readdirSync(logDir);
+  } catch (error) {
+    return {
+      text: "",
+      unreadable: [`could not read the worker logs in ${logDir}: ${error.message}`],
+    };
+  }
+  const text = [];
+  const unreadable = [];
+  for (const name of names) {
+    if (!name.endsWith(".log") && !name.endsWith(".status")) continue;
+    try {
+      text.push(readFileSync(join(logDir, name), "utf8"));
+    } catch (error) {
+      unreadable.push(`could not read the worker log ${join(logDir, name)}: ${error.message}`);
+    }
+  }
+  return { text: text.join("\n"), unreadable };
+}
+
+/**
  * Spawn the worker and settle when it closes. `error` (the command could not
  * start) and `close` both end the run; whichever comes first wins.
  * @param {string} worker
@@ -307,18 +344,28 @@ function spawnWorker(worker, args, options) {
  *
  * Chunk workers run concurrently (see runPool), so this is async: the run
  * completes on the child's close event rather than blocking the event loop.
+ * `signal` aborts the child when another chunk hits a rate limit.
  *
  * Exit 4 means eco-worker was blocked because at least one optional Bash call
  * was refused. When the leg still wrote a parseable verdict.json the review is
  * usable, so it is accepted without a retry and the refusals are reported.
  * Exit 4 without a valid verdict, and every other non-zero exit, is retried and
- * then reported as an ERROR. `timeoutSeconds` scales with the chunk size: the
- * reviewer reads the repository, so a bigger chunk needs longer.
- * @param {{ workdir: string, logDir: string, verdictPath: string, prompt: string, timeoutSeconds: number }} options
- * @returns {Promise<{ ok: true, blocked: boolean, retried: boolean } | { ok: false, error: string, retried: boolean }>}
+ * then reported as an ERROR.
+ *
+ * A 429 is never retried and is fatal for the whole review: the caller cancels
+ * the other chunks. A turn-cap report is not retried either; it is an ERROR
+ * unless the leg still wrote a valid verdict. Both are read from eco-worker's
+ * log/status files in `logDir`, and eco-worker runs with
+ * ECO_WORKER_NO_RETRY_429=1 and ECO_WORKER_MAX_TURNS from the environment.
+ * `timeoutSeconds` scales with the chunk size: the reviewer reads the
+ * repository, so a bigger chunk needs longer.
+ * @param {{ workdir: string, logDir: string, verdictPath: string, prompt: string, timeoutSeconds: number, signal?: AbortSignal }} options
+ * @returns {Promise<{ ok: true, blocked: boolean, retried: boolean, turnCapped?: boolean } | { ok: false, error: string, retried: boolean, rateLimited?: boolean, detail?: string, turnCap?: boolean, cancelled?: boolean }>}
  */
-async function runWorker({ workdir, logDir, verdictPath, prompt, timeoutSeconds }) {
+async function runWorker({ workdir, logDir, verdictPath, prompt, timeoutSeconds, signal }) {
   const worker = workerCommand();
+  const maxTurns = maxTurnsFromEnv();
+  const noRetry429 = noRetry429FromEnv();
   let lastFailure = null;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     // A retry must never read the previous attempt's verdict.
@@ -329,14 +376,59 @@ async function runWorker({ workdir, logDir, verdictPath, prompt, timeoutSeconds 
     const result = await spawnWorker(worker, ["-t", String(timeoutSeconds), "-d", workdir, prompt], {
       cwd: workdir,
       stdio: "inherit",
-      env: { ...process.env, ECO_WORKER_LOG_DIR: logDir },
+      signal,
+      env: {
+        ...process.env,
+        ECO_WORKER_LOG_DIR: logDir,
+        ECO_WORKER_NO_RETRY_429: noRetry429 ? "1" : "0",
+        ECO_WORKER_MAX_TURNS: String(maxTurns),
+      },
     });
+    // Aborted because another chunk was rate limited: not an attempt worth retrying.
+    if (signal?.aborted)
+      return {
+        ok: false,
+        cancelled: true,
+        error: "cancelled after another chunk hit the rate limit",
+        retried: attempt > 1,
+      };
     if (result.error)
       return {
         ok: false,
         error: `${worker} could not start: ${result.error.message}`,
         retried: attempt > 1,
       };
+    const validVerdict = readVerdictFile(verdictPath)?.ok === true;
+    // A clean exit with a verdict is a finished chunk; nothing else is trusted.
+    if (result.status === 0 && validVerdict) return { ok: true, blocked: false, retried: attempt > 1 };
+    const evidence = logText(logDir);
+    // Unreadable evidence is a failed review, not a missing rejection: name the
+    // path and error instead of retrying past a 429 nobody could read.
+    if (evidence.unreadable.length > 0)
+      return { ok: false, error: evidence.unreadable.join("; "), retried: attempt > 1 };
+    // A 429 is the quota signal this tool exists to respect: no retry, no
+    // further chunks. The caller cancels every other chunk worker.
+    const rate = rateLimitDetail(evidence.text);
+    if (rate !== null)
+      return {
+        ok: false,
+        rateLimited: true,
+        detail: rate,
+        error: `rate limited (429): ${rate}`,
+        retried: attempt > 1,
+      };
+    // The turn cap is deterministic; retrying would spend quota for the same result.
+    const cap = turnCapDetail(evidence.text);
+    if (cap !== null) {
+      if (validVerdict)
+        return { ok: true, blocked: false, turnCapped: true, retried: attempt > 1 };
+      return {
+        ok: false,
+        turnCap: true,
+        error: `turn cap (${maxTurns} turns): ${cap}`,
+        retried: attempt > 1,
+      };
+    }
     if (result.status === 0) return { ok: true, blocked: false, retried: attempt > 1 };
     lastFailure = result.status === null ? `was killed by ${result.signal}` : `exited ${result.status}`;
     // A blocked leg that still wrote its verdict reviewed the chunk; accept it.
@@ -383,6 +475,8 @@ function readChunkVerdict(verdictPath, run, logDir) {
       workerNote: "exit 4 (blocked): refused calls listed",
       refused: refusedCalls(logDir),
     };
+  if (run.turnCapped)
+    return { parsed, workerNote: "turn cap reached, but verdict.json is valid", refused: [] };
   return {
     parsed,
     workerNote: run.retried ? "exited non-zero once; the retry succeeded" : "exit 0",
@@ -397,14 +491,23 @@ function readChunkVerdict(verdictPath, run, logDir) {
  * chunk gets its own worker run in `<run>/chunks/<n>/`, with the repository root
  * as the worker's working directory so it can read the code the diff talks
  * about. Each run's timeout scales with its chunk size (workerTimeoutSeconds).
- * Chunk workers run concurrently, at most DIFF_REVIEW_CONCURRENCY (default 4,
+ * Chunk workers run concurrently, at most DIFF_REVIEW_CONCURRENCY (default 2,
  * minimum 1) at a time; results are merged in chunk order regardless of which
  * worker finished first. The verdicts are merged (any chunk ERROR => ERROR, else
  * any FAIL => FAIL), and a chunk set that does not cover every file in the diff
- * is an ERROR.
- * @param {{ diff: string, base: string, rules: ReturnType<typeof loadRules>, outDir: string, label?: string, blocking: boolean, workdir?: string, maxChars?: number }} options
+ * is an ERROR. A diff that yields no chunks is an ERROR too: a review that
+ * looked at nothing cannot be a PASS.
+ *
+ * A chunk that reports a rate limit (429) cancels every other chunk worker and
+ * makes the whole review an ERROR; no further chunks are started. A turn-capped
+ * chunk without a valid verdict is an ERROR too.
+ *
+ * `delta` turns this into an incremental review of the diff since an earlier
+ * verdict's head; deltaReview combines the result with the earlier verdict.
+ * @param {{ diff: string, base: string, rules: ReturnType<typeof loadRules>, outDir: string, label?: string, blocking: boolean, workdir?: string, maxChars?: number, head?: string | null, delta?: { since: string, path: string, result: string, earlier: ReturnType<typeof parseEarlierVerdict> } | null }} options
  *   `outDir` holds one directory per run; the oldest are pruned. `workdir` is
- *   the repository root (defaults to `outDir` for the self-test).
+ *   the repository root (defaults to `outDir` for the self-test). `head` is the
+ *   commit under review, recorded in verdict.md.
  * @returns {Promise<{ parsed: ReturnType<typeof parseVerdict>, decision: ReturnType<typeof decide>, dir: string, verdictMd: string }>}
  */
 export async function review({
@@ -416,6 +519,8 @@ export async function review({
   blocking,
   workdir = null,
   maxChars = DIFF_REVIEW_CHUNK_CHARS,
+  head = null,
+  delta = null,
 }) {
   const runsDir = resolve(outDir);
   mkdirSync(runsDir, { recursive: true });
@@ -464,19 +569,40 @@ export async function review({
   }
 
   let parsed;
+  let deltaOutcome = null;
   if (!rules.ok) {
     // No rules, no review: a reviewer without them would judge from memory.
     parsed = { ok: false, error: rules.error };
   } else if (coverage.length > 0) {
     // Nothing may be silently dropped.
     parsed = { ok: false, error: `diff coverage is incomplete: ${coverage.join("; ")}` };
+  } else if (chunkRows.length === 0) {
+    // Fail closed: a review of zero chunks has looked at nothing, so it cannot
+    // be a PASS. At an unchanged head the earlier verdict still covers the code.
+    parsed = {
+      ok: false,
+      error:
+        delta === null
+          ? "nothing to review: the diff is empty and no verdict was produced"
+          : `nothing changed since the earlier verdict at ${delta.since}; reuse that verdict instead of a new one`,
+    };
   } else {
     const concurrency = concurrencyFromEnv();
     console.log(
       `[diff-review] reviewing ${chunkRows.length} chunk(s), ${concurrency} at a time`,
     );
+    // One controller for the whole review: aborted as soon as a chunk reports 429.
+    const controller = new AbortController();
+    const rateLimit = { hit: null };
     // runPool keeps the results in chunk order even when later chunks finish first.
     const results = await runPool(chunkRows, concurrency, async (row) => {
+      if (rateLimit.hit !== null) {
+        // No further chunks start once a 429 is known.
+        const note = `not started: cancelled after the rate limit in chunk ${rateLimit.hit.index}`;
+        row.parsed = { ok: false, error: note };
+        row.workerNote = note;
+        return { index: row.index, parsed: row.parsed };
+      }
       mkdirSync(row.dir, { recursive: true });
       const chunkPatch = resolve(join(row.dir, "diff.patch"));
       if (split.chunks.length > 1) writeFileSync(chunkPatch, row.chunk.text);
@@ -494,6 +620,7 @@ export async function review({
         rulePaths: ruleFiles,
         decidedPath,
         workdir: runWorkdir,
+        delta,
       });
       writeFileSync(join(row.dir, "prompt.md"), prompt);
       const run = await runWorker({
@@ -502,14 +629,35 @@ export async function review({
         verdictPath,
         prompt,
         timeoutSeconds: workerTimeoutSeconds(row.chars),
+        signal: controller.signal,
       });
+      if (run.ok === false && run.rateLimited === true && rateLimit.hit === null) {
+        rateLimit.hit = { index: row.index, detail: run.detail };
+        // Cancel the chunk workers already running; no later one will start.
+        controller.abort();
+      }
       const verdict = readChunkVerdict(verdictPath, run, row.dir);
       row.parsed = verdict.parsed;
       row.workerNote = verdict.workerNote;
       row.refused = verdict.refused;
       return { index: row.index, parsed: verdict.parsed };
     });
-    parsed = mergeVerdicts(results);
+    parsed =
+      rateLimit.hit === null
+        ? mergeVerdicts(results)
+        : {
+            ok: false,
+            error: `ERROR: rate limited (429) in chunk ${rateLimit.hit.index}: ${rateLimit.hit.detail}`,
+          };
+  }
+
+  if (delta !== null && rules.ok && coverage.length === 0) {
+    deltaOutcome = deltaReview({
+      parsed,
+      reviewedFiles: split.files,
+      earlier: delta.earlier,
+    });
+    parsed = deltaOutcome.parsed;
   }
 
   const oversize = chunkRows.some((row) => row.oversize === true);
@@ -521,11 +669,14 @@ export async function review({
       parsed,
       decision,
       base,
+      head,
       diff,
       chunkRows,
       files: split.files,
       runWorkdir,
       coverage,
+      delta,
+      deltaOutcome,
     }),
   );
   return { parsed, decision, dir, verdictMd };
@@ -534,24 +685,32 @@ export async function review({
 /**
  * The human record of one review, next to the patch and the raw verdict. It
  * lists every chunk and every file the diff names, so coverage is auditable.
- * @param {{ parsed: ReturnType<typeof parseVerdict>, decision: ReturnType<typeof decide>, base: string, diff: string, chunkRows: Array<object>, files: string[], runWorkdir: string, coverage: string[] }} options
+ * @param {{ parsed: ReturnType<typeof parseVerdict>, decision: ReturnType<typeof decide>, base: string, head: string | null, diff: string, chunkRows: Array<object>, files: string[], runWorkdir: string, coverage: string[], delta: { since: string, path: string, result: string } | null, deltaOutcome: { unchangedFiles: string[] } | null }} options
  * @returns {string}
  */
 function renderVerdictMarkdown({
   parsed,
   decision,
   base,
+  head,
   diff,
   chunkRows,
   files,
   runWorkdir,
   coverage,
+  delta,
+  deltaOutcome,
 }) {
   const lines = [
     `# ${decision.line}`,
     "",
     `- at: ${new Date().toISOString()}`,
+    // A direct review() call (tests, embedders) passes no head; main() always does.
+    `- head: ${head ?? "(unknown)"}`,
     `- base: ${base}`,
+    ...(delta === null
+      ? []
+      : [`- delta since ${delta.since}, earlier verdict ${delta.path} (${delta.result})`]),
     `- diff: ${diff.length} characters`,
     `- working directory: ${runWorkdir}`,
     `- chunks: ${chunkRows.length}`,
@@ -584,13 +743,27 @@ function renderVerdictMarkdown({
   for (const file of files)
     lines.push(`- ${file} (chunk ${chunksByFile.get(file)?.join(", ") ?? "not covered"})`);
   lines.push("");
+  if (delta !== null) {
+    // The delta's evidence is complete only if the files it did not re-review
+    // are named, with the earlier verdict that still covers them.
+    lines.push(
+      `## Files unchanged since ${delta.since} (covered by the earlier verdict ${delta.path})`,
+      "",
+    );
+    const unchanged = deltaOutcome?.unchangedFiles ?? [];
+    if (unchanged.length === 0) lines.push("None.");
+    for (const file of unchanged) lines.push(`- ${file}`);
+    lines.push("");
+  }
   if (parsed.ok === false) {
     lines.push("## ERROR", "", parsed.error, "");
   } else {
     lines.push("## Findings", "");
     if (parsed.findings.length === 0) lines.push("None.");
     for (const finding of parsed.findings) {
-      lines.push(`- \`${finding.file}:${finding.line ?? "-"}\` ${finding.rule} — ${finding.why}`);
+      // An earlier verdict may list a finding with no why; do not add a fake one.
+      const why = finding.why.length > 0 ? ` — ${finding.why}` : "";
+      lines.push(`- \`${finding.file}:${finding.line ?? "-"}\` ${finding.rule}${why}`);
     }
     lines.push("", "## Untested", "");
     if (parsed.untested.length === 0) lines.push("None.");
@@ -676,6 +849,52 @@ export function collectDiff(root, base) {
 }
 
 /**
+ * The delta a `--since-verdict` review builds on: read the earlier verdict, check
+ * its head is an ancestor of `head`, and collect only the changes since that
+ * head. The earlier verdict must not be an ERROR and must carry a head sha; a
+ * delta with no changes yields no chunks, and review() reports an ERROR asking
+ * for the earlier verdict to be reused rather than reviewing nothing.
+ * @param {string} root repository top.
+ * @param {string} sincePath path to the earlier verdict.md, as the user gave it.
+ * @param {string | null} head current HEAD sha.
+ * @returns {{ ok: true, diff: string, earlierPath: string, earlier: ReturnType<typeof parseEarlierVerdict> } | { ok: false, error: string }}
+ */
+export function prepareDelta(root, sincePath, head) {
+  const earlierPath = resolve(sincePath);
+  if (!existsSync(earlierPath))
+    return { ok: false, error: `--since-verdict ${sincePath} does not exist` };
+  let text;
+  try {
+    text = readFileSync(earlierPath, "utf8");
+  } catch (error) {
+    return { ok: false, error: `--since-verdict ${sincePath} could not be read: ${error.message}` };
+  }
+  const earlier = parseEarlierVerdict(text);
+  if (!earlier.ok) return { ok: false, error: `${sincePath}: ${earlier.error}` };
+  if (earlier.result === "ERROR")
+    return {
+      ok: false,
+      error: `--since-verdict ${sincePath} is an ERROR verdict; there is nothing trusted to review a delta against`,
+    };
+  if (head === null)
+    return { ok: false, error: "--since-verdict needs a git HEAD to compare against" };
+  const ancestor = spawnSync("git", ["merge-base", "--is-ancestor", earlier.head, head], {
+    cwd: root,
+    encoding: "utf8",
+  });
+  if (ancestor.error)
+    return { ok: false, error: `git merge-base could not run: ${ancestor.error.message}` };
+  if (ancestor.status !== 0)
+    return {
+      ok: false,
+      error: `--since-verdict head ${earlier.head} is not an ancestor of HEAD (${head})`,
+    };
+  const collected = collectDiff(root, earlier.head);
+  if (!collected.ok) return collected;
+  return { ok: true, diff: collected.diff, earlierPath, earlier };
+}
+
+/**
  * A failed setup (git, a missing patch) goes through the same verdict line as a
  * reviewer ERROR, so it exits 1 in both modes.
  * @param {string} error
@@ -718,6 +937,7 @@ async function selfTest() {
       outDir: join(state, "self-test-runs"),
       label: testCase.name,
       blocking: false,
+      head: "(self-test fixture)",
     });
     const verdict = result.parsed.ok === false ? "ERROR" : result.parsed.verdict;
     const findings = result.parsed.ok === false ? 0 : result.parsed.findings.length;
@@ -807,13 +1027,14 @@ function status() {
  * Parse argv into the mode.
  * @param {string[]} argv
  * @param {Record<string, string | undefined>} env
- * @returns {{ mode: "review" | "self-test" | "status", base: string, diffFile: string | null } | { error: string }}
+ * @returns {{ mode: "review" | "self-test" | "status", base: string, diffFile: string | null, sinceVerdict: string | null } | { error: string }}
  */
 export function parseArgs(argv, env = process.env) {
   const options = {
     mode: "review",
     base: env.DIFF_REVIEW_BASE ? env.DIFF_REVIEW_BASE : "origin/main",
     diffFile: null,
+    sinceVerdict: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -828,6 +1049,12 @@ export function parseArgs(argv, env = process.env) {
         return { error: "--diff-file needs a path" };
       options.diffFile = value;
       i += 1;
+    } else if (arg === "--since-verdict") {
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith("--"))
+        return { error: "--since-verdict needs a path to an earlier verdict.md" };
+      options.sinceVerdict = value;
+      i += 1;
     } else if (arg === "--self-test") options.mode = "self-test";
     else if (arg === "--status") options.mode = "status";
     else if (arg === "-h" || arg === "--help") options.mode = "help";
@@ -836,8 +1063,9 @@ export function parseArgs(argv, env = process.env) {
   return options;
 }
 
-const USAGE = `usage: diff-review [--base <ref>] [--diff-file <path>] | --self-test | --status
+const USAGE = `usage: diff-review [--base <ref>] [--diff-file <path> | --since-verdict <verdict.md>] | --self-test | --status
 Reviews the change against <ref> (default DIFF_REVIEW_BASE or origin/main) with eco-worker.
+--since-verdict reviews only what changed since an earlier verdict's head.
 Advisory by default; DIFF_REVIEW_BLOCKING=1 makes a FAIL exit 1. See README.md.`;
 
 /**
@@ -859,22 +1087,46 @@ async function main(argv) {
   if (options.mode === "self-test") return await selfTest();
   const top = repoRoot();
   if (!top.ok) return setupError(top.error);
-  const collected =
-    options.diffFile === null ? collectDiff(top.root, options.base) : readPatch(options.diffFile);
-  if (!collected.ok) return setupError(collected.error);
-  if (collected.diff.trim().length === 0) {
-    console.log("diff-review: nothing to review");
-    return 0;
-  }
+  if (options.diffFile !== null && options.sinceVerdict !== null)
+    return setupError("--since-verdict cannot be combined with --diff-file; delta mode reads the repository");
+  // A repository with no commits has no HEAD: report the git error rather than
+  // writing a verdict whose "- head:" line --since-verdict could never use.
+  const headResult = git(["rev-parse", "HEAD"], top.root);
+  if (!headResult.ok) return setupError(headResult.error);
+  const head = headResult.stdout.trim();
   const mergeBase = mergeBaseOf(top.root, options.base);
   const rules = mergeBase.ok ? loadRules(top.root, mergeBase.sha) : mergeBase;
+  let diff;
+  let delta = null;
+  if (options.sinceVerdict !== null) {
+    const prepared = prepareDelta(top.root, options.sinceVerdict, head);
+    if (!prepared.ok) return setupError(prepared.error);
+    diff = prepared.diff;
+    delta = {
+      since: prepared.earlier.head,
+      path: prepared.earlierPath,
+      result: prepared.earlier.result,
+      earlier: prepared.earlier,
+    };
+  } else {
+    const collected =
+      options.diffFile === null ? collectDiff(top.root, options.base) : readPatch(options.diffFile);
+    if (!collected.ok) return setupError(collected.error);
+    diff = collected.diff;
+    if (diff.trim().length === 0) {
+      console.log("diff-review: nothing to review");
+      return 0;
+    }
+  }
   const result = await review({
-    diff: collected.diff,
+    diff,
     base: options.base,
     rules,
     outDir: join(top.root, ".diff-review"),
     blocking: blockingFromEnv(),
     workdir: top.root,
+    head,
+    delta,
   });
   report(result);
   return result.decision.exitCode;

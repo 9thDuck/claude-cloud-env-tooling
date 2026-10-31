@@ -2,6 +2,9 @@
 # eco-worker: run one headless Claude Code job on a cheaper Anthropic-compatible model, so routine work does not
 # spend the main model's quota. See README.md for setup and every environment variable.
 # Default timeout 1800 s; override with ECO_WORKER_TIMEOUT_S or -t. A leg with no log output for ECO_WORKER_STALL_S (600) s is killed.
+# ECO_WORKER_NO_RETRY_429=1 ends the leg at the first API 429 (diff-review sets this by default);
+# ECO_WORKER_MAX_TURNS=N kills the leg after more than N assistant turns and reports error_max_turns.
+# Both are reported on the RESULT line so a caller can tell a rate limit or a turn cap from a plain error.
 # Usage: eco-worker [-m model-id] [-t secs] [-d dir] [-b] [-a rule]... "<task>"
 #        eco-worker -r <run> [-t secs] [-d dir] [-b] [-a rule]... "<answers or path to answers file>"
 #   -m  model id sent to the endpoint (default ECO_WORKER_MODEL).
@@ -40,6 +43,8 @@ shift $((OPTIND-1)); task="${1:-}"
 [ -n "${ECO_WORKER_API_KEY:-}" ] || { echo "eco-worker: FAILED ECO_WORKER_API_KEY not set (the API key for $base_url)" >&2; exit 2; }
 case "$timeout_s" in ''|*[!0-9]*) echo "eco-worker: FAILED -t needs whole seconds" >&2; exit 2;; esac
 case "${ECO_WORKER_STALL_S:-600}" in ''|*[!0-9]*) echo "eco-worker: FAILED ECO_WORKER_STALL_S needs whole seconds" >&2; exit 2;; esac
+case "${ECO_WORKER_MAX_TURNS:-}" in '' ) max_turns="";; *[!0-9]*|0) echo "eco-worker: FAILED ECO_WORKER_MAX_TURNS needs a positive whole number" >&2; exit 2;; *) max_turns="$ECO_WORKER_MAX_TURNS";; esac
+no_retry_429=0; [ "${ECO_WORKER_NO_RETRY_429:-0}" = 1 ] && no_retry_429=1
 case "$model" in ''|*[[:space:]]*) echo "eco-worker: FAILED bad model id '$model'" >&2; exit 2;; esac
 for b in claude timeout jq python3 git setsid; do bp="$(type -P "$b")"; [ -n "$bp" ] || { echo "eco-worker: FAILED '$b' not found" >&2; exit 2; }; done
 [ -d "$workdir" ] || { echo "eco-worker: FAILED -d dir does not exist" >&2; exit 2; }
@@ -90,10 +95,14 @@ if [ -n "$resume" ] && [ -f "$gfile" ] && grep -q ' exit=7 ' "$status"; then
   [ "$(guard src)" = "$(cat "$gfile")" ] || { echo "eco-worker: FAILED run $run ended exit=7 (guardrails edited) and they still differ; revert the worker's edits to the wrapper, $perms, .claude/ or .git/hooks, then resume" >&2; exit 7; }
 fi
 guard0=""; nodenials=0; guardedit=0
-rc=""; denyhit=0; finished=0; autherr=0; cpid=""; stalled=0; stall_s="${ECO_WORKER_STALL_S:-600}"
+rc=""; denyhit=0; finished=0; autherr=0; err429=0; turncap=0; turns=0; cpid=""; stalled=0; stall_s="${ECO_WORKER_STALL_S:-600}"
 off=0; [ -f "$log" ] && off=$(stat -c %s "$log")
 hcount() { [ -f "$hlog" ] && awk '/^- DENIED /{n++} END{print n+0}' "$hlog" || echo 0; }
 leg() { [ -f "$log" ] && tail -c +$((off+1)) "$log"; }
+# The lines that may report a rejection: stream-json events other than the reviewer's own
+# user/assistant turns (a tool_result in those can echo a file that quotes "429"), plus
+# eco-worker's own "eco-worker:" status lines. Other non-JSON output cannot be a status.
+reportable() { printf '%s\n' "$1" | jq -cR '(try fromjson catch null) as $e | if ($e | type) == "object" then (if $e.type == "user" or $e.type == "assistant" then empty else $e end) elif startswith("eco-worker:") then . else empty end' 2>/dev/null; }
 # shellcheck disable=SC2120  # finish takes an optional result; the EXIT trap and the normal end call it bare.
 finish() {
   [ "$finished" = 1 ] && return; finished=1
@@ -101,6 +110,8 @@ finish() {
   legtxt="$(leg)"
   res="$(printf '%s\n' "$legtxt" | jq -cR 'fromjson? | select(type == "object" and .type == "result")' | tail -1)"
   if [ "$autherr" = 1 ]; then result=error; r=3
+  elif [ "$err429" = 1 ]; then result=error; [ "$r" = 0 ] && r=1
+  elif [ "$turncap" = 1 ]; then result=error; [ "$r" = 0 ] && r=1
   elif [ "$stalled" = 1 ]; then result=timeout; r=124
   elif [ "$r" = 124 ]; then result=timeout
   elif [ "$r" = killed ]; then result=killed; r=143
@@ -145,6 +156,8 @@ finish() {
   fi
   local line="eco-worker: RESULT=$result exit=$r run=$run api_retries=$retries denied=${denied:-0} asked=$asked files=$files"
   [ "$autherr" = 1 ] && line="$line error=api-auth-rejected(401/403): check ECO_WORKER_API_KEY and ECO_WORKER_BASE_URL"
+  [ "$err429" = 1 ] && line="$line api_error_status=429 error=rate-limit-rejected(429): the API refused for quota; no retry was attempted"
+  [ "$turncap" = 1 ] && line="$line turns=$turns max_turns=$max_turns error=error_max_turns(turn-cap)"
   [ "${denied:-0}" -gt 0 ] && [ -n "$res" ] && line="$line denied_tools=$(printf '%s' "$res" | jq -r '[.permission_denials[].tool_name] | join(",")') blocked=$bfile"
   [ "$result" != ok ] && [ "$result" != blocked ] && [ -n "$res" ] && line="$line error=$(printf '%s' "$res" | jq -r '.result // .subtype' | head -c 300 | tr '\n' ' ')"
   [ "$nodenials" = 1 ] && line="$line error=result-has-no-permission_denials(cannot prove no refusals)"
@@ -216,6 +229,16 @@ cpid=$!
 while [ -d "/proc/$cpid" ]; do
   lt="$(leg)"
   if [[ "$lt" == *'"error_status":401'* || "$lt" == *'"error_status":403'* ]]; then autherr=1; kill "$cpid"; break; fi
+  # A 429 is a quota stop, not a transient error to retry: end the leg before the
+  # API client's own retry loop spends more quota. diff-review asks for this by default.
+  # Only reportable lines count, so a tool_result echoing "api_error_status":429 does not kill a healthy run.
+  rt="$(reportable "$lt")"
+  if [ "$no_retry_429" = 1 ] && { [[ "$rt" == *'"error_status":429'* || "$rt" == *'"error_status": 429'* || "$rt" == *'"api_error_status":429'* || "$rt" == *'"api_error_status": 429'* || "$rt" == *'"rate_limit_error"'* ]]; }; then err429=1; echo "eco-worker: RATE LIMITED (429) no retry, ending run $run" | tee -a "$log" >&2; kill "$cpid"; break; fi
+  # Turn cap: count assistant turns in this leg; going past the cap ends the leg.
+  if [ -n "$max_turns" ]; then
+    turns="$(printf '%s\n' "$lt" | grep -c '"type":"assistant"' || true)"
+    if [ "${turns:-0}" -gt "$max_turns" ]; then turncap=1; echo "eco-worker: TURN CAP $max_turns reached, ending run $run" | tee -a "$log" >&2; kill "$cpid"; break; fi
+  fi
   # Stall watchdog: a log with no new line for $stall_s seconds means a hung call; end the run loudly.
   m="$(stat -c %Y "$log")"
   if [ -n "$m" ] && [ "$(( $(date +%s) - m ))" -gt "$stall_s" ]; then stalled=1; echo "eco-worker: STALLED no log output for ${stall_s}s, killing run $run" | tee -a "$log" >&2; kill "$cpid"; break; fi
