@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_DIFF_CHARS,
   blockingFromEnv,
+  gateHeader,
   buildPrompt,
   decide,
   parseConfig,
@@ -55,7 +56,7 @@ describe("decide", () => {
 
   it("exits 0 on an advisory FAIL and 1 on a blocking FAIL", () => {
     expect(decide({ parsed: fail, blocking: false })).toMatchObject({ exitCode: 0 });
-    expect(decide({ parsed: fail, blocking: false }).line).toContain("FAIL (advisory) 1 finding");
+    expect(decide({ parsed: fail, blocking: false }).line).toContain("FAIL (required gate, not acceptance) 1 finding");
     expect(decide({ parsed: fail, blocking: true })).toMatchObject({ exitCode: 1 });
   });
 
@@ -137,5 +138,24 @@ describe("parseConfig", () => {
     ["a bad decided path", '{"rules":["r.md"],"decided":"../d.md"}'],
   ])("rejects %s", (_name, text) => {
     expect(parseConfig(text).ok).toBe(false);
+  });
+});
+
+describe("gateHeader", () => {
+  const diff = "diff --git a/x b/x\n+1\ndiff --git a/y b/y\n+2\n";
+  it("writes the header check-gates reads", () => {
+    expect(gateHeader({ decision: { line: "diff-review: PASS (required gate, not acceptance) 0 findings" }, head: "abc", diff, refused: 0 })).toEqual([
+      "Gate: diff-review",
+      "Head: abc",
+      "Status: PASS",
+      "Coverage: 2/2",
+      "Runner: eco-worker",
+      "Refused calls: 0",
+    ]);
+  });
+  it("reports unknown refusals and ERROR status", () => {
+    const header = gateHeader({ decision: { line: "diff-review: ERROR (x) y" }, head: "abc", diff, refused: null });
+    expect(header).toContain("Status: ERROR");
+    expect(header).toContain("Refused calls: unknown");
   });
 });

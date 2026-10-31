@@ -17,7 +17,7 @@ pass() { echo "PASS   $*"; }
 fail() { echo "FAILED $*"; failed=1; }
 
 mkdir -p "$bin" || { echo "FAILED cannot create $bin"; exit 1; }
-for link in "eco-worker:eco-worker/eco-worker.sh" "diff-review:diff-review/diff-review.mjs"; do
+for link in "eco-worker:eco-worker/eco-worker.sh" "diff-review:diff-review/diff-review.mjs" "check-gates:check-gates/check-gates.mjs"; do
   name="${link%%:*}"; target="$here/${link#*:}"
   if chmod +x "$target" && ln -sfn "$target" "$bin/$name"; then pass "linked $bin/$name -> $target"; else fail "could not link $bin/$name"; fi
 done

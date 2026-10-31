@@ -6,9 +6,9 @@
  * (test/diff-review-lib.test.mjs). No file, process or network I/O in this
  * module: the CLI owns all of that.
  *
- * Advisory by default: a FAIL is printed and exits 0. DIFF_REVIEW_BLOCKING=1
- * makes a FAIL exit 1 (blockingFromEnv). An ERROR exits 1 in both modes.
- * The review is a second reader, never acceptance.
+ * diff-review is a required gate, not acceptance: check-gates refuses a merge
+ * without its PASS verdict on the PR head. A FAIL exits 0 unless
+ * DIFF_REVIEW_BLOCKING=1 (blockingFromEnv); an ERROR exits 1 in both modes.
  */
 
 /**
@@ -209,6 +209,36 @@ export function parseVerdict(text) {
 }
 
 /**
+ * Files a unified diff touches, counted by its `diff --git` headers.
+ * @param {string} diff
+ * @returns {number}
+ */
+export function diffFileCount(diff) {
+  return (diff.match(/^diff --git /gm) ?? []).length;
+}
+
+/**
+ * The fixed header check-gates reads (check-gates/check-gates-lib.mjs).
+ * Coverage counts only files whose whole patch reached the reviewer.
+ * @param {{ decision: { line: string }, head: string, diff: string, refused: number | null }} options
+ *   `refused` is null when the worker's refusal count could not be read.
+ * @returns {string[]}
+ */
+export function gateHeader({ decision, head, diff, refused }) {
+  const status = /^diff-review: (PASS|FAIL|ERROR)/.exec(decision.line)?.[1] ?? "ERROR";
+  const total = diffFileCount(diff);
+  const seen = diff.length > MAX_DIFF_CHARS ? Math.max(0, diffFileCount(diff.slice(0, MAX_DIFF_CHARS)) - 1) : total;
+  return [
+    "Gate: diff-review",
+    `Head: ${head}`,
+    `Status: ${status}`,
+    `Coverage: ${seen}/${total}`,
+    "Runner: eco-worker",
+    `Refused calls: ${refused === null ? "unknown" : refused}`,
+  ];
+}
+
+/**
  * The review's one human line and exit code.
  *
  * Blocking is the single switch for a reviewer FAIL. ERROR (the review never
@@ -219,7 +249,7 @@ export function parseVerdict(text) {
  * @returns {{ exitCode: 0 | 1, line: string }}
  */
 export function decide({ parsed, blocking, truncated = false }) {
-  const mode = blocking === true ? "blocking" : "advisory";
+  const mode = "required gate, not acceptance";
   if (parsed.ok === true && parsed.verdict === "PASS" && truncated === true) {
     return {
       exitCode: 1,
@@ -237,13 +267,13 @@ export function decide({ parsed, blocking, truncated = false }) {
     const untested = parsed.untested.length;
     return {
       exitCode: blocking === true ? 1 : 0,
-      line: `diff-review: FAIL (${mode}) ${count} finding${count === 1 ? "" : "s"}${untested > 0 ? `, ${untested} untested` : ""} — second reader, never acceptance`,
+      line: `diff-review: FAIL (${mode}) ${count} finding${count === 1 ? "" : "s"}${untested > 0 ? `, ${untested} untested` : ""}`,
     };
   }
   const untested = parsed.untested.length;
   return {
     exitCode: 0,
-    line: `diff-review: PASS (${mode}) 0 findings${untested > 0 ? `, ${untested} untested` : ""} — second reader, never acceptance`,
+    line: `diff-review: PASS (${mode}) 0 findings${untested > 0 ? `, ${untested} untested` : ""}`,
   };
 }
 

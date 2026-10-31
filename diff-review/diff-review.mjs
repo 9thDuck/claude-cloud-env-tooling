@@ -15,10 +15,11 @@
  * verdict.json there; the CLI reads only that file (never the worker's stdout),
  * prints the findings, writes verdict.md and exits by decide() (diff-review-lib.mjs).
  *
- * Advisory by default: a FAIL is printed and exits 0. DIFF_REVIEW_BLOCKING=1 makes
- * a FAIL exit 1. An ERROR (the review never ran or gave no valid verdict) exits 1
- * in both modes, so a broken review never looks green. The review is a second
- * reader, never acceptance.
+ * A required gate, not acceptance: verdict.md opens with the fixed header
+ * check-gates reads (Gate, Head, Status, Coverage, Runner, Refused calls).
+ * A FAIL exits 0 unless DIFF_REVIEW_BLOCKING=1. An ERROR (the review never ran
+ * or gave no valid verdict) exits 1 in both modes, so a broken review never
+ * looks green.
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -41,6 +42,7 @@ import {
   DECIDED_COPY,
   MAX_DIFF_CHARS,
   blockingFromEnv,
+  gateHeader,
   buildPrompt,
   decide,
   parseConfig,
@@ -221,10 +223,13 @@ export function fixtureHashProblems(dir) {
  * Run the worker once, retrying once on a non-zero exit.
  * @param {string} dir working directory the reviewer treats as its own.
  * @param {string} prompt
- * @returns {{ ok: true, retried: boolean } | { ok: false, error: string, retried: boolean }}
+ * @returns {{ ok: true, retried: boolean, refused: number | null } | { ok: false, error: string, retried: boolean, refused: number | null }}
+ *   `refused` is the last run's denied= count from eco-worker's RESULT line, null if absent.
  */
 function runWorker(dir, prompt) {
   const worker = workerCommand();
+  /** @type {number | null} */
+  let refused = null;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     // A retry must never read the previous attempt's verdict.
     rmSync(join(dir, "verdict.json"), { force: true });
@@ -232,28 +237,33 @@ function runWorker(dir, prompt) {
     const result = spawnSync(worker, ["-t", TIMEOUT_SECONDS, "-d", dir, prompt], {
       cwd: dir,
       encoding: "utf8",
-      stdio: "inherit",
+      stdio: ["inherit", "pipe", "inherit"],
     });
     if (result.error)
       return {
         ok: false,
         error: `${worker} could not start: ${result.error.message}`,
         retried: attempt > 1,
+        refused: null,
       };
-    if (result.status === 0) return { ok: true, retried: attempt > 1 };
+    process.stdout.write(result.stdout);
+    const denied = /\bdenied=(\d+)/.exec(result.stdout);
+    refused = denied === null ? null : Number(denied[1]);
+    if (result.status === 0) return { ok: true, retried: attempt > 1, refused };
     // Loud: a failed reviewer run is a failed review, never a quiet PASS.
     console.error(`[diff-review] FAILED: worker exited ${result.status} on attempt ${attempt}/2`);
   }
-  return { ok: false, error: "the worker exited non-zero twice", retried: true };
+  return { ok: false, error: "the worker exited non-zero twice", retried: true, refused };
 }
 
 /**
  * Review one diff and leave the evidence on disk.
- * @param {{ diff: string, base: string, rules: ReturnType<typeof loadRules>, outDir: string, label?: string, blocking: boolean }} options
+ * @param {{ diff: string, base: string, head?: string, rules: ReturnType<typeof loadRules>, outDir: string, label?: string, blocking: boolean }} options
+ *   `head` is the commit reviewed, for the gate header.
  *   `outDir` holds one directory per run; the oldest are pruned.
  * @returns {{ parsed: ReturnType<typeof parseVerdict>, decision: ReturnType<typeof decide>, dir: string, verdictMd: string }}
  */
-export function review({ diff, base, rules, outDir, label = "", blocking }) {
+export function review({ diff, base, head = "(none)", rules, outDir, label = "", blocking }) {
   mkdirSync(outDir, { recursive: true });
   // Run files must not show up in the repo's git status or the next review's diff.
   if (!existsSync(join(outDir, ".gitignore"))) writeFileSync(join(outDir, ".gitignore"), "*\n");
@@ -282,7 +292,7 @@ export function review({ diff, base, rules, outDir, label = "", blocking }) {
     run = runWorker(dir, prompt);
   } else {
     // No rules, no review: a reviewer without them would judge from memory.
-    run = { ok: false, error: rules.error, retried: false };
+    run = { ok: false, error: rules.error, retried: false, refused: null };
   }
 
   const verdictPath = join(dir, "verdict.json");
@@ -306,17 +316,19 @@ export function review({ diff, base, rules, outDir, label = "", blocking }) {
 
   const decision = decide({ parsed, blocking, truncated: diff.length > MAX_DIFF_CHARS });
   const verdictMd = join(dir, "verdict.md");
-  writeFileSync(verdictMd, renderVerdictMarkdown({ parsed, decision, base, diff, workerNote }));
+  writeFileSync(verdictMd, renderVerdictMarkdown({ parsed, decision, base, diff, workerNote, header: gateHeader({ decision, head, diff, refused: run.refused }) }));
   return { parsed, decision, dir, verdictMd };
 }
 
 /**
  * The human record of one review, next to the patch and the raw verdict.
- * @param {{ parsed: ReturnType<typeof parseVerdict>, decision: ReturnType<typeof decide>, base: string, diff: string, workerNote: string }} options
+ * @param {{ parsed: ReturnType<typeof parseVerdict>, decision: ReturnType<typeof decide>, base: string, diff: string, workerNote: string, header: string[] }} options
  * @returns {string}
  */
-function renderVerdictMarkdown({ parsed, decision, base, diff, workerNote }) {
+function renderVerdictMarkdown({ parsed, decision, base, diff, workerNote, header }) {
   const lines = [
+    ...header,
+    "",
     `# ${decision.line}`,
     "",
     `- at: ${new Date().toISOString()}`,
@@ -405,6 +417,20 @@ export function collectDiff(root, base) {
     untracked += added.stdout;
   }
   return { ok: true, diff: `${committed.stdout}${uncommitted.stdout}${untracked}` };
+}
+
+/**
+ * The commit under review for the gate header. Uncommitted or untracked work
+ * makes it "<sha>+dirty", which never equals a PR head, so check-gates fails it.
+ * @param {string} root
+ * @returns {string}
+ */
+function headOf(root) {
+  const sha = git(["rev-parse", "HEAD"], root);
+  if (!sha.ok) return "(unknown)";
+  const dirty = git(["status", "--porcelain"], root);
+  if (!dirty.ok) return "(unknown)";
+  return dirty.stdout.trim() === "" ? sha.stdout.trim() : `${sha.stdout.trim()}+dirty`;
 }
 
 /**
@@ -570,7 +596,7 @@ export function parseArgs(argv, env = process.env) {
 
 const USAGE = `usage: diff-review [--base <ref>] [--diff-file <path>] | --self-test | --status
 Reviews the change against <ref> (default DIFF_REVIEW_BASE or origin/main) with eco-worker.
-Advisory by default; DIFF_REVIEW_BLOCKING=1 makes a FAIL exit 1. See README.md.`;
+A required gate, not acceptance. A FAIL exits 0 unless DIFF_REVIEW_BLOCKING=1. See README.md.`;
 
 /**
  * The CLI.
@@ -604,6 +630,7 @@ function main(argv) {
     diff: collected.diff,
     base: options.base,
     rules,
+    head: options.diffFile === null ? headOf(top.root) : "(diff file)",
     outDir: join(top.root, ".diff-review"),
     blocking: blockingFromEnv(),
   });
