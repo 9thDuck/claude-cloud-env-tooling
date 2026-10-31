@@ -487,9 +487,36 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
         error: `${worker} could not start: ${result.error.message}`,
         retried: attempt > 1,
       };
+    // A refused call is a failed review whatever the leg wrote. eco-worker keeps
+    // every attempt's *.blocked.md, so a turn cap or a clean retry must not hide
+    // one behind a verdict. Exit 4 has its own branch below, which lists the calls.
+    let refusedFiles;
+    try {
+      refusedFiles = readdirSync(logDir)
+        .filter((name) => name.endsWith(".blocked.md"))
+        .sort();
+    } catch (error) {
+      return {
+        ok: false,
+        error: `could not read the worker logs in ${logDir}: ${error.message}`,
+        retried: attempt > 1,
+      };
+    }
+    const refusal =
+      refusedFiles.length > 0
+        ? {
+            ok: false,
+            blocked: true,
+            error: `a worker attempt refused a call (${refusedFiles.join(", ")}); a blocked review is not a review`,
+            retried: attempt > 1,
+          }
+        : null;
+    // Every ok path goes through this: a refusal in any attempt fails the chunk,
+    // and no retry follows it.
+    const okResult = (extra) => (refusal !== null ? refusal : { ok: true, retried: attempt > 1, ...extra });
     const validVerdict = readVerdictFile(verdictPath)?.ok === true;
     // A clean exit with a verdict is a finished chunk; nothing else is trusted.
-    if (result.status === 0 && validVerdict) return { ok: true, retried: attempt > 1 };
+    if (result.status === 0 && validVerdict) return okResult({});
     const evidence = logText(logDir);
     // Unreadable evidence is a failed review, not a missing rejection: name the
     // path and error instead of retrying past a 429 nobody could read.
@@ -509,7 +536,7 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
     // The turn cap is deterministic; retrying would spend quota for the same result.
     const cap = turnCapDetail(evidence.text);
     if (cap !== null) {
-      if (validVerdict) return { ok: true, turnCapped: true, retried: attempt > 1 };
+      if (validVerdict) return okResult({ turnCapped: true });
       return {
         ok: false,
         turnCap: true,
@@ -517,7 +544,7 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
         retried: attempt > 1,
       };
     }
-    if (result.status === 0) return { ok: true, retried: attempt > 1 };
+    if (result.status === 0) return okResult({});
     // Blocked: a refused call is part of the review that did not happen.
     if (result.status === 4)
       return {
@@ -798,7 +825,7 @@ export async function review({
 
   const oversize = chunkRows.some((row) => row.oversize === true);
   const decision = decide({ parsed, blocking, oversize });
-  writeFileSync(join(dir, "verdict.json"), `${JSON.stringify(runVerdict({ parsed, base, head }), null, 2)}\n`);
+  writeFileSync(join(dir, "verdict.json"), `${JSON.stringify(runVerdict({ parsed, decision, base, head }), null, 2)}\n`);
   const verdictMd = join(dir, "verdict.md");
   writeFileSync(
     verdictMd,
@@ -820,14 +847,23 @@ export async function review({
 }
 
 /**
- * The run's machine-readable verdict: the merged result, never a worker's raw
- * file, so an ERROR is written as an ERROR.
- * @param {{ parsed: ReturnType<typeof parseVerdict>, base: string, head: string | null }} options
+ * The run's machine-readable verdict, taken from the decision so the file and
+ * the exit code can never disagree: an oversize chunk is an ERROR here even
+ * when the merged verdict is a PASS.
+ * @param {{ parsed: ReturnType<typeof parseVerdict>, decision: ReturnType<typeof decide>, base: string, head: string | null }} options
  * @returns {{ verdict: "PASS" | "FAIL" | "ERROR", head: string | null, base: string, error?: string, findings: Array<object>, untested: string[] }}
  */
-export function runVerdict({ parsed, base, head }) {
-  if (parsed.ok === false) return { verdict: "ERROR", head, base, error: parsed.error, findings: [], untested: [] };
-  return { verdict: parsed.verdict, head, base, findings: parsed.findings, untested: parsed.untested };
+export function runVerdict({ parsed, decision, base, head }) {
+  if (decision.verdict === "ERROR")
+    return {
+      verdict: "ERROR",
+      head,
+      base,
+      error: parsed.ok === false ? parsed.error : decision.line,
+      findings: [],
+      untested: [],
+    };
+  return { verdict: decision.verdict, head, base, findings: parsed.findings, untested: parsed.untested };
 }
 
 /**
