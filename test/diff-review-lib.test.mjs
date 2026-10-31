@@ -118,7 +118,8 @@ describe("allowedBashCommands", () => {
         permissions: { allow: ["Read(/x/**)", "Bash(git show:*)", "Bash(ls)", 3], deny: ["Bash(rm:*)"] },
       }),
     ).toEqual(["git show", "ls"]);
-    expect(allowedBashCommands({})).toEqual([]);
+    expect(allowedBashCommands({ permissions: { allow: [] } })).toEqual([]);
+    expect(allowedBashCommands({})).toBeNull();
   });
 });
 
@@ -153,6 +154,8 @@ describe("buildPrompt", () => {
     expect(prompt).toContain("Your working directory is /runs/1/chunks/2");
     expect(prompt).toContain("The repository is at /repo");
     expect(prompt).toContain("plain git show");
+    expect(prompt).toContain("Your working directory is /runs/1/chunks/2, this chunk's directory");
+    expect(prompt).toContain("any change makes the review an ERROR");
     expect(prompt).not.toContain("Bash is limited to");
     expect(prompt).toContain("git -C is refused");
     expect(prompt).toContain("- src/a.js");

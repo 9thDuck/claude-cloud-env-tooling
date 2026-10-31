@@ -8,6 +8,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
@@ -520,7 +521,7 @@ describe("review: a blocked worker (exit 4)", () => {
   it("is an ERROR on exit 124 (timeout), not retried, and verdict.json says ERROR", async () => {
     const result = await runReview(script("timeout.sh", TIMEOUT_WORKER));
     expect(result.parsed.ok).toBe(false);
-    expect(result.parsed.error).toMatch(/timed out after \d+s \(exit 124\); not retried/);
+    expect(result.parsed.error).toMatch(/timed out \(exit 124: the \d+s limit or eco-worker's stall watchdog; its log says which\); not retried/);
     expect(attempts(result)).toBe(1);
     const top = JSON.parse(readFileSync(join(result.dir, "verdict.json"), "utf8"));
     expect(top.verdict).toBe("ERROR");
@@ -1027,6 +1028,17 @@ describe("repoState", () => {
     const afterUntracked = repoState(repo);
     expect(afterUntracked.state).not.toBe(afterTracked.state);
     expect(repoState(repo).state).toBe(afterUntracked.state);
+  });
+
+  it("records an untracked symlink to a directory by its target instead of failing", () => {
+    const repo = makeRepo("state-link-");
+    mkdirSync(join(repo, "real"));
+    symlinkSync("real", join(repo, "link"));
+    const before = repoState(repo);
+    expect(before.ok).toBe(true);
+    rmSync(join(repo, "link"));
+    symlinkSync("elsewhere", join(repo, "link"));
+    expect(repoState(repo).state).not.toBe(before.state);
   });
 
   it("is not ok where git cannot read the repository", () => {

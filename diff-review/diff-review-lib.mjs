@@ -750,7 +750,9 @@ export function ruleCopies(paths) {
  * @returns {string[]}
  */
 export function allowedBashCommands(permissions) {
-  const allow = Array.isArray(permissions?.permissions?.allow) ? permissions.permissions.allow : [];
+  // No allow list is a broken permissions file, not an empty one: the caller errors.
+  const allow = permissions?.permissions?.allow;
+  if (!Array.isArray(allow)) return null;
   return allow.flatMap((entry) => {
     const match = typeof entry === "string" ? /^Bash\((.+?)(?::\*)?\)$/.exec(entry) : null;
     return match === null ? [] : [match[1]];
@@ -814,11 +816,11 @@ export function buildPrompt({
     "",
     readRoot === null
       ? `Your working directory is ${workdir}. There is no repository to read for this review; judge the diff and the rule files. The only files you may write are ${verdictPath} and the progress file named in your WORKER RULES.`
-      : `Your working directory is ${workdir}, this review's run directory. The repository is at ${readRoot}: read it with Read, Grep and Glob on absolute paths under ${readRoot}, and with plain git show/log/diff/blame/rev-parse/ls-files run from your working directory, which is inside the repository (git -C is refused); that is where you verify what the diff claims. The repository is read-only for you: any edit there is refused. The only files you may write are ${verdictPath} and the progress file named in your WORKER RULES.`,
+      : `Your working directory is ${workdir}, this chunk's directory. The repository is at ${readRoot}: read it with Read, Grep and Glob on absolute paths under ${readRoot}, and with plain git show/log/diff/blame/rev-parse/ls-files run from your working directory, which is inside the repository (git -C is refused); that is where you verify what the diff claims. Do not change the repository: the run compares its state before and after you, and any change makes the review an ERROR. The only files you may write are ${verdictPath} and the progress file named in your WORKER RULES.`,
     ...(allowedCommands.length > 0
       ? [
           `Bash is limited to these commands: ${allowedCommands.join(", ")}. Do not run tests, builds, node or any other command: a refused call makes the whole review an ERROR. List what you could not check that way under \`untested\` instead.`,
-          "Run one command per Bash call, from your working directory: no cd, no ; or && chains, no $? or other variables. A pipe is fine only when every command in it is on that list. sed is refused: read a line range with the Read tool (offset and limit) instead. Paths outside the repository and your run directory are refused.",
+          "Run one command per Bash call, from your working directory: no cd, no ; or && chains, no $? or other variables. A pipe is fine only when every command in it is on that list. sed only as sed -n to print a line range (or use the Read tool with offset and limit). Paths outside the repository and your run directory are refused.",
         ]
       : []),
     "",

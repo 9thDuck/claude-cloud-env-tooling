@@ -11,9 +11,9 @@
  * Run it inside the repository under review. The rules come from .diff-review.json
  * at the merge-base commit (see README.md), or the bundled rules/default-rules.md
  * when the repo has no config. Each run's diff, prompt, rules and verdict go to
- * <repo>/.diff-review/<UTC timestamp>/, which git ignores. The reviewer writes
- * verdict.json there; the CLI reads only that file (never the worker's stdout),
- * prints the findings, writes verdict.md and exits by decide() (diff-review-lib.mjs).
+ * <repo>/.diff-review/<UTC timestamp>/, which git ignores. Each chunk's reviewer
+ * writes chunks/<n>/verdict.json; the CLI reads only those files (never the
+ * worker's stdout), merges them into the run's own verdict.json, prints the findings, writes verdict.md and exits by decide() (diff-review-lib.mjs).
  *
  * Advisory by default: a FAIL is printed and exits 0. DIFF_REVIEW_BLOCKING=1 makes
  * a FAIL exit 1. An ERROR (the review never ran or gave no valid verdict) exits 1
@@ -26,7 +26,9 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  lstatSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   rmSync,
   statSync,
@@ -110,12 +112,29 @@ export function repoState(root) {
   for (const path of untracked.stdout.split("\0").filter(Boolean).sort()) {
     hash.update(`\0${path}\0`);
     try {
-      hash.update(readFileSync(join(root, path)));
+      // A symlink (to a directory, say) is recorded by its target, not read.
+      const full = join(root, path);
+      hash.update(lstatSync(full).isSymbolicLink() ? `link ${readlinkSync(full)}` : readFileSync(full));
     } catch (error) {
       return { ok: false, error: `could not read untracked ${path}: ${error.message}` };
     }
   }
   return { ok: true, state: `HEAD ${head.stdout.trim()}\n${status.stdout}\ncontent ${hash.digest("hex")}` };
+}
+
+/**
+ * The Bash commands reviewer-permissions.json allows, for the prompt.
+ * @returns {{ ok: true, commands: string[] } | { ok: false, error: string }}
+ */
+function loadReviewerCommands() {
+  try {
+    const commands = allowedBashCommands(JSON.parse(readFileSync(REVIEWER_PERMISSIONS, "utf8")));
+    return commands === null
+      ? { ok: false, error: `${REVIEWER_PERMISSIONS} has no permissions.allow list` }
+      : { ok: true, commands };
+  } catch (error) {
+    return { ok: false, error: `could not read ${REVIEWER_PERMISSIONS}: ${error.message}` };
+  }
 }
 
 /**
@@ -382,9 +401,10 @@ function spawnWorker(worker, args, options) {
  * Exit 4 means eco-worker was blocked because at least one call was refused.
  * A blocked review did not do what it was asked, so it is an ERROR even when it
  * wrote a verdict, and it is not retried: the same prompt meets the same
- * refusal. The refused calls are reported. Exit 124 is the timeout; it is an
- * ERROR and not retried either, because a retry spends the same quota and is
- * cut off at the same point. Every other non-zero exit is retried once and
+ * refusal. The refused calls are reported. Exit 124 is eco-worker's timeout
+ * (`-t`) or its no-output stall watchdog; it is an ERROR and not retried
+ * either, so one hung or slow leg cannot spend the quota twice; its log says
+ * which of the two it was. Every other non-zero exit is retried once and
  * then reported as an ERROR.
  *
  * A 429 is never retried and is fatal for the whole review: the caller cancels
@@ -471,12 +491,12 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
         error: `the worker exited 4 (blocked): refused calls are listed; a blocked review is not a review${validVerdict ? ", so its verdict.json is not used" : ""}`,
         retried: attempt > 1,
       };
-    // Timed out: a retry would spend the same quota and stop at the same point.
+    // Timed out or stalled: a retry would spend the quota a second time.
     if (result.status === 124)
       return {
         ok: false,
         timedOut: true,
-        error: `the worker timed out after ${timeoutSeconds}s (exit 124); not retried`,
+        error: `the worker timed out (exit 124: the ${timeoutSeconds}s limit or eco-worker's stall watchdog; its log says which); not retried`,
         retried: attempt > 1,
       };
     lastFailure = result.status === null ? `was killed by ${result.signal}` : `exited ${result.status}`;
@@ -612,10 +632,14 @@ export async function review({
   }
 
   // A reviewer that changed the repository did not review what it was given.
+  const reviewerCommands = loadReviewerCommands();
   const stateBefore = repoDir === null ? null : repoState(repoDir);
   let parsed;
   let deltaOutcome = null;
-  if (stateBefore !== null && !stateBefore.ok) {
+  if (!reviewerCommands.ok) {
+    // The prompt must name the reviewer's commands, or its first guess blocks the run.
+    parsed = { ok: false, error: reviewerCommands.error };
+  } else if (stateBefore !== null && !stateBefore.ok) {
     // Without a before-state the read-only check cannot run, so no review starts.
     parsed = { ok: false, error: `could not record the repository state at ${repoDir} before the review, so the read-only check cannot run: ${stateBefore.error}` };
   } else if (!rules.ok) {
@@ -662,9 +686,7 @@ export async function review({
         decidedPath,
         workdir: row.dir,
         readRoot: repoDir,
-        allowedCommands: allowedBashCommands(
-          JSON.parse(readFileSync(REVIEWER_PERMISSIONS, "utf8")),
-        ),
+        allowedCommands: reviewerCommands.commands,
         delta,
       });
       writeFileSync(join(row.dir, "prompt.md"), prompt);
@@ -1045,6 +1067,7 @@ function status() {
     ...FIXTURE_FILES.map((name) => join(FIXTURES, name)),
     join(FIXTURES, "fixtures.sha256"),
     DEFAULT_RULES,
+    REVIEWER_PERMISSIONS,
   ];
   for (const file of required) {
     if (!existsSync(file)) {

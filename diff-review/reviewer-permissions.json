@@ -25,6 +25,7 @@
       "Bash(file:*)",
       "Bash(stat:*)",
       "Bash(cut:*)",
+      "Bash(sed -n:*)",
       "Bash(diff:*)",
       "Bash(cmp:*)",
       "Bash(jq:*)",
@@ -50,7 +51,6 @@
       "Bash(rm:*)",
       "Bash(mv:*)",
       "Bash(cp:*)",
-      "Bash(sed:*)",
       "Bash(tee:*)"
     ]
   }
