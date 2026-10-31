@@ -29,8 +29,10 @@ export const DIFF_REVIEW_CHUNK_CHARS_MIN = 5000;
 
 /**
  * The chunk size: DIFF_REVIEW_CHUNK_CHARS when it is valid (see
- * chunkCharsError), else 20000. The CLI refuses an invalid value before any
- * worker runs, so the fallback is only reached by a value it already rejected.
+ * chunkCharsError), else 20000. An unset or empty value gets the 20000
+ * default; any other value is either a valid integer of at least
+ * DIFF_REVIEW_CHUNK_CHARS_MIN, or chunkCharsError rejects it before any worker
+ * runs.
  * @param {Record<string, string | undefined>} env
  * @returns {number}
  */
@@ -60,7 +62,13 @@ export const WORKER_TIMEOUT_STEP_SECONDS = 600;
 export const WORKER_TIMEOUT_STEP_CHARS = 50000;
 export const WORKER_TIMEOUT_MAX_SECONDS = 3600;
 
-/** Seconds allowed per turn of the turn cap, so the cap is reached before the timeout. */
+/**
+ * Seconds the turn-derived timeout allows per turn of the turn cap, so a run
+ * whose turns take 30 seconds or less reaches the turn cap before the timeout.
+ * The turn-derived timeout is capped at WORKER_TIMEOUT_TURN_MAX_SECONDS, and an
+ * explicit DIFF_REVIEW_TIMEOUT_SECONDS wins over it; under either, a slow run
+ * can hit the timeout before the cap.
+ */
 export const WORKER_TIMEOUT_SECONDS_PER_TURN = 30;
 /** The turn-derived timeout never exceeds this, whatever DIFF_REVIEW_MAX_TURNS says. */
 export const WORKER_TIMEOUT_TURN_MAX_SECONDS = 7200;

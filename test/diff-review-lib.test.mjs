@@ -348,7 +348,7 @@ describe("workerTimeoutSeconds", () => {
     expect(workerTimeoutSeconds(1000000, {}, 1)).toBe(3600);
   });
 
-  it("never times out before the turn cap: 30s per turn wins when larger", () => {
+  it("allows 30s per turn of the cap when the turn-derived timeout is larger", () => {
     // 20K default chunk: 60 turns = 1800s beats the 1200s size formula.
     expect(workerTimeoutSeconds(20000, {})).toBe(1800);
     // 52K chunk (the P1a case): 92 turns = 2760s beats 1800s.
@@ -651,7 +651,7 @@ describe("chunkCharsFromEnv", () => {
     expect(chunkCharsFromEnv({ DIFF_REVIEW_CHUNK_CHARS: "8000" })).toBe(8000);
   });
 
-  it("falls back only for a value chunkCharsError rejects", () => {
+  it("defaults to 20000 when unset or empty, and falls back for a value chunkCharsError rejects", () => {
     expect(chunkCharsFromEnv({ DIFF_REVIEW_CHUNK_CHARS: "0" })).toBe(20000);
     expect(chunkCharsFromEnv({ DIFF_REVIEW_CHUNK_CHARS: "big" })).toBe(20000);
     expect(chunkCharsFromEnv({ DIFF_REVIEW_CHUNK_CHARS: "1" })).toBe(20000);
