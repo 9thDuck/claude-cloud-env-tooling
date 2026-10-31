@@ -372,9 +372,12 @@ function spawnWorker(worker, args, options) {
  * `signal` aborts the child when another chunk hits a rate limit.
  *
  * The worker runs in `workdir`, the chunk's own run directory, so the only
- * files its edits are accepted in are its run files. `readRoot`, the
- * repository root, is passed as an eco-worker `-a "Read(/<root>/**)"` rule:
- * the reviewer can read the repository but not change it.
+ * files its edits are accepted in are its run files. `readRoot` is passed as an
+ * eco-worker `-a "Read(/<root>/**)"` rule: the repository root, or the run
+ * directory when there is no repository, so the rule copies in `<run>/rules/`
+ * stay readable. The rule and reviewer-permissions.json keep the reviewer to
+ * reads, but they are not a boundary (an allowed command can still write
+ * through a shell redirect); review() checks the repository state instead.
  *
  * Exit 4 means eco-worker was blocked because at least one call was refused.
  * A blocked review did not do what it was asked, so it is an ERROR even when it
@@ -391,7 +394,7 @@ function spawnWorker(worker, args, options) {
  * ECO_WORKER_NO_RETRY_429=1 and ECO_WORKER_MAX_TURNS derived from the chunk size (maxTurnsFor).
  * `timeoutSeconds` scales with the chunk size and its turn cap
  * (workerTimeoutSeconds).
- * @param {{ workdir: string, readRoot: string | null, logDir: string, verdictPath: string, prompt: string, timeoutSeconds: number, chunkChars: number, signal?: AbortSignal }} options
+ * @param {{ workdir: string, readRoot: string, logDir: string, verdictPath: string, prompt: string, timeoutSeconds: number, chunkChars: number, signal?: AbortSignal }} options
  * @returns {Promise<{ ok: true, retried: boolean, turnCapped?: boolean } | { ok: false, error: string, retried: boolean, rateLimited?: boolean, detail?: string, turnCap?: boolean, cancelled?: boolean, blocked?: boolean, timedOut?: boolean }>}
  */
 async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeoutSeconds, chunkChars, signal }) {
@@ -406,8 +409,7 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
       `[diff-review] worker attempt ${attempt}/2 (workdir ${workdir}, logs ${logDir}, timeout ${timeoutSeconds}s)`,
     );
     // `-a` rules come before `-d`; eco-worker takes the task as the last argument.
-    const readRule = readRoot === null ? [] : ["-a", `Read(/${readRoot}/**)`];
-    const result = await spawnWorker(worker, ["-t", String(timeoutSeconds), ...readRule, "-d", workdir, prompt], {
+    const result = await spawnWorker(worker, ["-t", String(timeoutSeconds), "-a", `Read(/${readRoot}/**)`, "-d", workdir, prompt], {
       cwd: workdir,
       stdio: "inherit",
       signal,
@@ -522,8 +524,9 @@ function readChunkVerdict(verdictPath, run, logDir) {
  * A diff over DIFF_REVIEW_CHUNK_CHARS is split into chunks (splitDiff); each
  * chunk gets its own worker run in `<run>/chunks/<n>/` (a one-chunk diff too),
  * with that directory as the worker's working directory and the repository root
- * (`readRoot`) readable but not writable, so it can read the code the diff talks
- * about and cannot change it. Each run's timeout scales with its chunk size and
+ * (`readRoot`) readable, so it can read the code the diff talks about. A review
+ * whose reviewer changed the repository (repoState before and after) is an
+ * ERROR. Each run's timeout scales with its chunk size and
  * turn cap (workerTimeoutSeconds).
  * Chunk workers run concurrently, at most DIFF_REVIEW_CONCURRENCY (default 2,
  * minimum 1) at a time; results are merged in chunk order regardless of which
@@ -667,7 +670,7 @@ export async function review({
       writeFileSync(join(row.dir, "prompt.md"), prompt);
       const run = await runWorker({
         workdir: row.dir,
-        readRoot: repoDir,
+        readRoot: repoDir ?? resolve(dir),
         logDir: row.dir,
         verdictPath,
         prompt,

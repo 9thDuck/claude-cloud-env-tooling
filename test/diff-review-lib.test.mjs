@@ -127,6 +127,8 @@ describe("buildPrompt", () => {
     const prompt = buildPrompt({ base: "main", allowedCommands: ["git show", "grep"] });
     expect(prompt).toContain("Bash is limited to these commands: git show, grep.");
     expect(prompt).toContain("a refused call makes the whole review an ERROR");
+    expect(prompt).toContain("Run one command per Bash call");
+    expect(prompt).toContain("no cd");
   });
 
   it("names absolute rule paths, the project, the files and the chunk", () => {

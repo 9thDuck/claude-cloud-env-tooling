@@ -12,7 +12,7 @@
       "Bash(git rev-list:*)",
       "Bash(git ls-tree:*)",
       "Bash(git cat-file:*)",
-      "Bash(git merge-base:*)",
+      "Bash(git check-ignore:*)",
       "Bash(git branch --show-current)",
       "Bash(ls:*)",
       "Bash(grep:*)",

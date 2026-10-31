@@ -277,6 +277,33 @@ describe("review: repo read access and chunking", () => {
     expect(oldWay.status).not.toBe(0);
   });
 
+  it("gives the worker a read rule for the run directory when there is no repository (self-test)", async () => {
+    const previous = process.env.DIFF_REVIEW_WORKER;
+    const argsDir = mkdtempSync(join(WORK, "args-worker-"));
+    extraDirs.push(argsDir);
+    const argsWorker = join(argsDir, "args-worker.sh");
+    writeFileSync(argsWorker, ARGS_WORKER);
+    chmodSync(argsWorker, 0o755);
+    process.env.DIFF_REVIEW_WORKER = argsWorker;
+    try {
+      const outDir = mkdtempSync(join(WORK, "no-root-"));
+      extraDirs.push(outDir);
+      const result = await review({
+        diff: `${fileSection("src/feature.js")}\n`,
+        base: "main",
+        rules: defaultRules(),
+        outDir,
+        blocking: false,
+      });
+      expect(result.parsed).toMatchObject({ ok: true, verdict: "PASS" });
+      const args = readFileSync(join(result.dir, "chunks", "1", "args.txt"), "utf8").split("\n");
+      // The rule copies live in <run>/rules/, outside the chunk directory.
+      expect(args).toContain(`Read(/${resolve(result.dir)}/**)`);
+    } finally {
+      process.env.DIFF_REVIEW_WORKER = previous;
+    }
+  });
+
   it("runs one worker per chunk and lists every chunk and file", async () => {
     const repo = makeRepo("chunks-");
     const diff = [
@@ -395,6 +422,13 @@ const TIMEOUT_WORKER = `#!/usr/bin/env bash
 out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
 printf 'x\\n' >> "$out/attempts"
 exit 124
+`;
+
+// Records its arguments, one per line, and passes.
+const ARGS_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf '%s\\n' "$@" > "$out/args.txt"
+printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
 `;
 
 // Records the permissions file it was given, then edits the repository it may

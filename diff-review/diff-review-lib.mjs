@@ -818,6 +818,7 @@ export function buildPrompt({
     ...(allowedCommands.length > 0
       ? [
           `Bash is limited to these commands: ${allowedCommands.join(", ")}. Do not run tests, builds, node or any other command: a refused call makes the whole review an ERROR. List what you could not check that way under \`untested\` instead.`,
+          "Run one command per Bash call, from your working directory: no cd, no ; or && chains, no $? or other variables. A pipe is fine only when every command in it is on that list. sed is refused: read a line range with the Read tool (offset and limit) instead. Paths outside the repository and your run directory are refused.",
         ]
       : []),
     "",
