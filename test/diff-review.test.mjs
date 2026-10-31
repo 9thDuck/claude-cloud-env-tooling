@@ -805,8 +805,8 @@ printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.
 exit 143
 `;
 
-// Attempt 1 is refused and fails; attempt 2 is clean and passes. eco-worker
-// keeps every attempt's files, so the refusal must still fail the chunk.
+// Attempt 1 is refused and exits non-zero; a second attempt would be clean and
+// pass. The refusal must end the chunk as an ERROR without that retry.
 const REFUSED_THEN_CLEAN_WORKER = `#!/usr/bin/env bash
 out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
 printf 'x\\n' >> "$out/attempts"
@@ -866,7 +866,7 @@ describe("review: a refused call in any attempt", () => {
     expect(JSON.parse(readFileSync(join(result.dir, "verdict.json"), "utf8")).verdict).toBe("ERROR");
   });
 
-  it("is an ERROR when an earlier attempt was refused and the retry passed", async () => {
+  it("is an ERROR and is not retried when a refused attempt exits non-zero", async () => {
     process.env.DIFF_REVIEW_WORKER = script("refused-retry.sh", REFUSED_THEN_CLEAN_WORKER);
     const repo = makeRepo("refused-retry-");
     const result = await review({

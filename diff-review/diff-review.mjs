@@ -425,7 +425,9 @@ function spawnWorker(worker, args, options) {
  * (`-t`) or its no-output stall watchdog; it is an ERROR and not retried
  * either, so one hung or slow leg cannot spend the quota twice; its log says
  * which of the two it was. Every other non-zero exit is retried once and
- * then reported as an ERROR.
+ * then reported as an ERROR, except an attempt that left a refused call
+ * (a *.blocked.md in its log dir): that ends the chunk as an ERROR at once,
+ * because a retry would repeat a call that is already refused.
  *
  * A 429 is never retried and is fatal for the whole review: the caller cancels
  * the other chunks. A turn-cap report is not retried either; it is an ERROR
