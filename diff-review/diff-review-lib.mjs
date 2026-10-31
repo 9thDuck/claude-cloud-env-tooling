@@ -90,24 +90,72 @@ export function noRetry429FromEnv(env = process.env) {
   return env.ECO_WORKER_NO_RETRY_429 !== "0";
 }
 
-/** A stream-json line that reports a rate-limit rejection. */
-const RATE_LIMIT_RE =
-  /"error_status"\s*:\s*429|"api_error_status"\s*:\s*429|api_error_status=429|"rate_limit_error"/;
+/**
+ * `line` as a JSON object, or null when it is not one.
+ * @param {string} line
+ * @returns {Record<string, any> | null}
+ */
+function jsonObject(line) {
+  try {
+    const value = JSON.parse(line);
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
 
-/** A worker line that reports the assistant's turn cap. */
-const TURN_CAP_RE = /error_max_turns|turn[- ]cap/i;
+/** eco-worker's own status lines start this way; the rest of a log is stream-json. */
+function isWorkerStatusLine(line) {
+  return line.startsWith("eco-worker:") || line.startsWith("RESULT=");
+}
+
+/**
+ * A line that reports a rate-limit rejection: a stream-json event whose
+ * top-level api_error_status or error_status is 429, or whose error.type is
+ * "rate_limit_error"; or an eco-worker status line carrying the
+ * api_error_status=429 field. A user/assistant event never counts: its text can
+ * echo a tool_result that quotes this file or a log mentioning 429.
+ * @param {string} line
+ * @returns {boolean}
+ */
+function isRateLimitLine(line) {
+  const event = jsonObject(line);
+  if (event !== null) {
+    if (event.type === "user" || event.type === "assistant") return false;
+    const status = event.api_error_status ?? event.error_status;
+    return status === 429 || status === "429" || event.error?.type === "rate_limit_error";
+  }
+  return isWorkerStatusLine(line) && /(?:^|\s)api_error_status=429(?:\s|$)/.test(line);
+}
+
+/**
+ * A line that reports the assistant's turn cap: a stream-json event whose
+ * subtype is "error_max_turns", or an eco-worker status line carrying the
+ * error=error_max_turns field. A user/assistant event never counts; neither
+ * does prose that merely mentions the words.
+ * @param {string} line
+ * @returns {boolean}
+ */
+function isTurnCapLine(line) {
+  const event = jsonObject(line);
+  if (event !== null) {
+    if (event.type === "user" || event.type === "assistant") return false;
+    return event.subtype === "error_max_turns";
+  }
+  return isWorkerStatusLine(line) && /(?:^|\s)error=error_max_turns\b/.test(line);
+}
 
 /**
  * The error text of a rate-limit rejection in worker log text, or null. The
- * first matching line is parsed when it is JSON so a nested error message is
- * reported instead of the whole event; otherwise the line itself is the
- * evidence.
+ * first matching line (see isRateLimitLine) is parsed when it is JSON so a
+ * nested error message is reported instead of the whole event; otherwise the
+ * line itself is the evidence.
  * @param {string} text log text.
  * @returns {string | null}
  */
 export function rateLimitDetail(text) {
   if (typeof text !== "string" || text.length === 0) return null;
-  const line = text.split("\n").find((entry) => RATE_LIMIT_RE.test(entry));
+  const line = text.split("\n").find(isRateLimitLine);
   if (line === undefined) return null;
   let detail = line.trim();
   try {
@@ -125,13 +173,14 @@ export function rateLimitDetail(text) {
 }
 
 /**
- * The text of a turn-cap report in worker log text, or null.
+ * The text of a turn-cap report in worker log text, or null. See isTurnCapLine
+ * for what counts.
  * @param {string} text log text.
  * @returns {string | null}
  */
 export function turnCapDetail(text) {
   if (typeof text !== "string" || text.length === 0) return null;
-  const line = text.split("\n").find((entry) => TURN_CAP_RE.test(entry));
+  const line = text.split("\n").find(isTurnCapLine);
   return line === undefined ? null : line.trim().slice(0, 400);
 }
 
@@ -536,6 +585,9 @@ function sectionLines(text, heading) {
 /**
  * The findings a verdict.md lists, in the same shape parseVerdict uses. A line
  * that cannot be read is skipped; the caller refuses a FAIL that lists none.
+ * A line without " — why" keeps an empty why: the earlier verdict gave no
+ * reason for this finding, and inventing one would put words in the reviewer's
+ * mouth.
  * @param {string} text
  * @returns {Array<{ file: string, line: number | null, rule: string, why: string }>}
  */
@@ -556,7 +608,7 @@ function findingsFromMarkdown(text) {
       file,
       line: Number.isFinite(line) ? line : null,
       rule,
-      why: why.length > 0 ? why : "carried from the earlier verdict",
+      why,
     });
   }
   return findings;

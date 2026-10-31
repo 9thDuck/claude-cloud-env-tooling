@@ -414,6 +414,13 @@ describe("parseEarlierVerdict", () => {
     expect(parsed.ok).toBe(false);
     expect(parsed.error).toContain("no readable findings");
   });
+
+  it("keeps an absent why empty instead of inventing one", () => {
+    const noWhy = verdictMd("FAIL").replace("- `src/a.js:3` No secrets — adds a key", "- `src/a.js:3` No secrets");
+    const parsed = parseEarlierVerdict(noWhy);
+    expect(parsed.ok).toBe(true);
+    expect(parsed.findings).toEqual([{ file: "src/a.js", line: 3, rule: "No secrets", why: "" }]);
+  });
 });
 
 describe("deltaReview", () => {
@@ -609,6 +616,16 @@ describe("rateLimitDetail", () => {
     expect(rateLimitDetail('{"type":"result","is_error":false,"result":"ok"}')).toBeNull();
     expect(rateLimitDetail("")).toBeNull();
   });
+
+  it("ignores 429 text echoed in a user/assistant event or in plain output", () => {
+    const echoed = [
+      '{"type":"user","api_error_status":429,"message":{"content":[{"type":"tool_result","content":"api_error_status=429"}]}}',
+      '{"type":"assistant","error":{"type":"rate_limit_error","message":"quoted from a file"},"message":{}}',
+      "the file says api_error_status=429 but nothing was rejected",
+      'log text: "rate_limit_error"',
+    ].join("\n");
+    expect(rateLimitDetail(echoed)).toBeNull();
+  });
 });
 
 describe("turnCapDetail", () => {
@@ -622,5 +639,14 @@ describe("turnCapDetail", () => {
   it("does not treat max_turns alone or a normal result as a cap hit", () => {
     expect(turnCapDetail("max_turns=40 turns=3")).toBeNull();
     expect(turnCapDetail('{"type":"result","is_error":false,"result":"ok"}')).toBeNull();
+  });
+
+  it("ignores turn-cap text echoed in a user/assistant event or in prose", () => {
+    const echoed = [
+      '{"type":"user","subtype":"error_max_turns","message":{"content":[{"type":"tool_result","content":"error_max_turns"}]}}',
+      '{"type":"assistant","message":{"content":"the TURN CAP is 40"},"subtype":"error_max_turns"}',
+      "the worker's source mentions error_max_turns and turn cap",
+    ].join("\n");
+    expect(turnCapDetail(echoed)).toBeNull();
   });
 });

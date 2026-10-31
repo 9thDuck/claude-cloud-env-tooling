@@ -99,6 +99,10 @@ rc=""; denyhit=0; finished=0; autherr=0; err429=0; turncap=0; turns=0; cpid=""; 
 off=0; [ -f "$log" ] && off=$(stat -c %s "$log")
 hcount() { [ -f "$hlog" ] && awk '/^- DENIED /{n++} END{print n+0}' "$hlog" || echo 0; }
 leg() { [ -f "$log" ] && tail -c +$((off+1)) "$log"; }
+# The lines that may report a rejection: stream-json events other than the reviewer's own
+# user/assistant turns (a tool_result in those can echo a file that quotes "429"), plus
+# eco-worker's own "eco-worker:" status lines. Other non-JSON output cannot be a status.
+reportable() { printf '%s\n' "$1" | jq -cR '(try fromjson catch null) as $e | if ($e | type) == "object" then (if $e.type == "user" or $e.type == "assistant" then empty else $e end) elif startswith("eco-worker:") then . else empty end' 2>/dev/null; }
 # shellcheck disable=SC2120  # finish takes an optional result; the EXIT trap and the normal end call it bare.
 finish() {
   [ "$finished" = 1 ] && return; finished=1
@@ -227,7 +231,9 @@ while [ -d "/proc/$cpid" ]; do
   if [[ "$lt" == *'"error_status":401'* || "$lt" == *'"error_status":403'* ]]; then autherr=1; kill "$cpid"; break; fi
   # A 429 is a quota stop, not a transient error to retry: end the leg before the
   # API client's own retry loop spends more quota. diff-review asks for this by default.
-  if [ "$no_retry_429" = 1 ] && { [[ "$lt" == *'"error_status":429'* || "$lt" == *'"error_status": 429'* || "$lt" == *'"api_error_status":429'* || "$lt" == *'"api_error_status": 429'* || "$lt" == *'"rate_limit_error"'* ]]; }; then err429=1; echo "eco-worker: RATE LIMITED (429) no retry, ending run $run" | tee -a "$log" >&2; kill "$cpid"; break; fi
+  # Only reportable lines count, so a tool_result echoing "api_error_status":429 does not kill a healthy run.
+  rt="$(reportable "$lt")"
+  if [ "$no_retry_429" = 1 ] && { [[ "$rt" == *'"error_status":429'* || "$rt" == *'"error_status": 429'* || "$rt" == *'"api_error_status":429'* || "$rt" == *'"api_error_status": 429'* || "$rt" == *'"rate_limit_error"'* ]]; }; then err429=1; echo "eco-worker: RATE LIMITED (429) no retry, ending run $run" | tee -a "$log" >&2; kill "$cpid"; break; fi
   # Turn cap: count assistant turns in this leg; going past the cap ends the leg.
   if [ -n "$max_turns" ]; then
     turns="$(printf '%s\n' "$lt" | grep -c '"type":"assistant"' || true)"
