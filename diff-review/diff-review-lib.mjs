@@ -19,12 +19,24 @@
 export const MAX_DIFF_CHARS = 200000;
 
 /**
- * Target chunk size (in characters) for one reviewer run. It is deliberately
- * smaller than MAX_DIFF_CHARS: the reviewer reads the repository to verify the
- * diff, so its run time grows with the chunk it is given. A bigger diff is split
- * by file (and a bigger file by hunk) so every file is reviewed; see splitDiff.
+ * Default chunk size (in characters) for one reviewer run. It is deliberately
+ * small: the reviewer reads the repository to verify the diff, so its turns and
+ * run time grow with the chunk it is given (a 52K chunk needed more than 40
+ * turns). A bigger diff is split by file (and a bigger file by hunk) so every
+ * file is reviewed; see splitDiff. Override with DIFF_REVIEW_CHUNK_CHARS.
  */
-export const DIFF_REVIEW_CHUNK_CHARS = 60000;
+export const DIFF_REVIEW_CHUNK_CHARS = 20000;
+
+/**
+ * The chunk size: a positive integer DIFF_REVIEW_CHUNK_CHARS, else 20000.
+ * @param {Record<string, string | undefined>} env
+ * @returns {number}
+ */
+export function chunkCharsFromEnv(env = process.env) {
+  const raw = env.DIFF_REVIEW_CHUNK_CHARS;
+  if (typeof raw === "string" && /^[1-9]\d*$/.test(raw)) return Number(raw);
+  return DIFF_REVIEW_CHUNK_CHARS;
+}
 
 /** Worker timeout: a base plus a step for every WORKER_TIMEOUT_STEP_CHARS. */
 export const WORKER_TIMEOUT_BASE_SECONDS = 600;
@@ -69,20 +81,26 @@ export function concurrencyFromEnv(env = process.env) {
   return DEFAULT_CONCURRENCY;
 }
 
-/** Assistant turns a chunk worker may take when DIFF_REVIEW_MAX_TURNS is not set. */
-export const DEFAULT_MAX_TURNS = 40;
+/** Turns every chunk worker may take before the per-1000-character allowance. */
+export const MAX_TURNS_BASE = 30;
+/** Extra turns allowed for every 1000 characters of the chunk. */
+export const MAX_TURNS_PER_1000_CHARS = 1;
 
 /**
- * The per-chunk turn cap: a positive integer DIFF_REVIEW_MAX_TURNS, else 40.
- * The cap is passed to eco-worker as ECO_WORKER_MAX_TURNS; a chunk that reaches
- * it without a valid verdict is an ERROR, never a PASS.
+ * The per-chunk turn cap. A positive integer DIFF_REVIEW_MAX_TURNS wins;
+ * otherwise it is derived from the chunk size (30 + 1 per 1000 characters), so
+ * a default run cannot hit the cap on its own chunking. The cap is passed to
+ * eco-worker as ECO_WORKER_MAX_TURNS; a chunk that reaches it without a valid
+ * verdict is an ERROR, never a PASS.
+ * @param {number} chunkChars characters in the chunk.
  * @param {Record<string, string | undefined>} env
  * @returns {number}
  */
-export function maxTurnsFromEnv(env = process.env) {
+export function maxTurnsFor(chunkChars, env = process.env) {
   const raw = env.DIFF_REVIEW_MAX_TURNS;
   if (typeof raw === "string" && /^[1-9]\d*$/.test(raw)) return Number(raw);
-  return DEFAULT_MAX_TURNS;
+  const size = Number.isFinite(chunkChars) && chunkChars > 0 ? chunkChars : 0;
+  return MAX_TURNS_BASE + Math.ceil(size / 1000) * MAX_TURNS_PER_1000_CHARS;
 }
 
 /**
