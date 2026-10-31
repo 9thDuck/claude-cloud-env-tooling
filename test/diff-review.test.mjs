@@ -891,8 +891,8 @@ describe("review: a refused call in any attempt", () => {
     expect(result.parsed.ok).toBe(false);
     expect(result.parsed.error).toContain("a worker attempt refused a call");
     expect(result.parsed.error).toContain("r1.blocked.md");
-    // The retry ran, but a refusal ends it: no third attempt.
-    expect(attempts(result)).toBe(2);
+    // A refusal ends the chunk: the retry must not spend a second attempt.
+    expect(attempts(result)).toBe(1);
     expect(JSON.parse(readFileSync(join(result.dir, "verdict.json"), "utf8")).verdict).toBe("ERROR");
   });
 
