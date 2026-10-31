@@ -444,13 +444,13 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
   // The reviewer runs in the chunk directory, so it needs a -C twin of each
   // read-only git allow rule for readRoot only; an unreadable file is an ERROR.
   let shipped;
+  const permissionsPath = join(logDir, "reviewer-permissions.json");
   try {
     shipped = JSON.parse(readFileSync(REVIEWER_PERMISSIONS, "utf8"));
+    writeFileSync(permissionsPath, `${JSON.stringify(reviewerPermissionsFor(shipped, readRoot), null, 2)}\n`);
   } catch (error) {
-    return { ok: false, retried: false, error: `could not read ${REVIEWER_PERMISSIONS}: ${error.message}` };
+    return { ok: false, retried: false, error: `could not build reviewer permissions from ${REVIEWER_PERMISSIONS}: ${error.message}` };
   }
-  const permissionsPath = join(logDir, "reviewer-permissions.json");
-  writeFileSync(permissionsPath, `${JSON.stringify(reviewerPermissionsFor(shipped, readRoot), null, 2)}\n`);
   let lastFailure = null;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     // A retry must never read the previous attempt's verdict.

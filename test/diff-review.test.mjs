@@ -76,8 +76,8 @@ function bashRuleMatches(rule, command) {
 }
 
 const commandAllowed = (permissions, command) =>
-  !(permissions.permissions?.deny ?? []).some((rule) => bashRuleMatches(rule, command)) &&
-  (permissions.permissions?.allow ?? []).some((rule) => bashRuleMatches(rule, command));
+  !permissions.permissions.deny.some((rule) => bashRuleMatches(rule, command)) &&
+  permissions.permissions.allow.some((rule) => bashRuleMatches(rule, command));
 
 // Proves what the worker may read: it reads app.js, a repo file outside the
 // diff, from the root its -a "Read(/<root>/**)" rule grants, and writes its

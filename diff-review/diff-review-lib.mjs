@@ -821,19 +821,25 @@ export function allowedBashCommands(permissions) {
  * under review. Only that root and only allow-listed subcommands get a twin,
  * so any other -C path or a write subcommand is refused. Deny rules are
  * copied; the input is not mutated.
- * @param {{ permissions?: { allow?: unknown[], deny?: unknown[] } }} permissions parsed permissions JSON.
+ * @param {{ permissions: { allow: unknown[], deny: unknown[] } }} permissions parsed permissions JSON.
  * @param {string} root the repository root under review.
  * @returns {Record<string, any>} a new permissions object.
+ * @throws {Error} when `permissions.permissions.allow` or `.deny` is not an array.
  */
 export function reviewerPermissionsFor(permissions, root) {
-  const source = permissions?.permissions ?? {};
-  const allow = Array.isArray(source.allow) ? source.allow : [];
-  const twins = allow.flatMap((rule) =>
+  const source = permissions.permissions;
+  if (!Array.isArray(source.allow)) {
+    throw new Error("reviewer permissions have no permissions.allow list");
+  }
+  if (!Array.isArray(source.deny)) {
+    throw new Error("reviewer permissions have no permissions.deny list");
+  }
+  const twins = source.allow.flatMap((rule) =>
     typeof rule === "string" && rule.startsWith("Bash(git ")
       ? [`Bash(git -C ${root} ${rule.slice("Bash(git ".length)}`]
       : [],
   );
-  const merged = { ...source, allow: [...allow, ...twins], deny: [...(source.deny ?? [])] };
+  const merged = { ...source, allow: [...source.allow, ...twins], deny: [...source.deny] };
   return { ...permissions, permissions: merged };
 }
 
