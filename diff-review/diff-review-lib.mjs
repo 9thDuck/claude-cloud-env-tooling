@@ -1007,19 +1007,21 @@ export function parseVerdict(text) {
  * was larger than the chunk limit is an ERROR in both modes: the reviewer may
  * not have read that chunk whole.
  * @param {{ parsed: ReturnType<typeof parseVerdict>, blocking?: boolean, oversize?: boolean }} options
- * @returns {{ exitCode: 0 | 1, line: string }}
+ * @returns {{ exitCode: 0 | 1, verdict: "PASS" | "FAIL" | "ERROR", line: string }}
  */
 export function decide({ parsed, blocking, oversize = false }) {
   const mode = blocking === true ? "blocking" : "advisory";
   if (parsed.ok === true && parsed.verdict === "PASS" && oversize === true) {
     return {
       exitCode: 1,
+      verdict: "ERROR",
       line: `diff-review: ERROR (${mode}) a chunk was larger than the chunk limit, so the reviewer may not have read it whole and a PASS cannot stand; split the change into smaller pieces`,
     };
   }
   if (parsed.ok === false) {
     return {
       exitCode: 1,
+      verdict: "ERROR",
       line: `diff-review: ERROR (${mode}) ${parsed.error}`,
     };
   }
@@ -1028,12 +1030,14 @@ export function decide({ parsed, blocking, oversize = false }) {
     const untested = parsed.untested.length;
     return {
       exitCode: blocking === true ? 1 : 0,
+      verdict: "FAIL",
       line: `diff-review: FAIL (${mode}) ${count} finding${count === 1 ? "" : "s"}${untested > 0 ? `, ${untested} untested` : ""} — second reader, never acceptance`,
     };
   }
   const untested = parsed.untested.length;
   return {
     exitCode: 0,
+    verdict: "PASS",
     line: `diff-review: PASS (${mode}) 0 findings${untested > 0 ? `, ${untested} untested` : ""} — second reader, never acceptance`,
   };
 }
