@@ -39,14 +39,14 @@ import { fileURLToPath } from "node:url";
 import {
   CONFIG_FILE,
   DECIDED_COPY,
-  DIFF_REVIEW_CHUNK_CHARS,
+  chunkCharsFromEnv,
   blockingFromEnv,
   buildPrompt,
   concurrencyFromEnv,
   coverageProblems,
   decide,
   deltaReview,
-  maxTurnsFromEnv,
+  maxTurnsFor,
   mergeVerdicts,
   noRetry429FromEnv,
   parseConfig,
@@ -345,12 +345,12 @@ function spawnWorker(worker, args, options) {
  * ECO_WORKER_NO_RETRY_429=1 and ECO_WORKER_MAX_TURNS from the environment.
  * `timeoutSeconds` scales with the chunk size: the reviewer reads the
  * repository, so a bigger chunk needs longer.
- * @param {{ workdir: string, logDir: string, verdictPath: string, prompt: string, timeoutSeconds: number, signal?: AbortSignal }} options
+ * @param {{ workdir: string, logDir: string, verdictPath: string, prompt: string, timeoutSeconds: number, chunkChars: number, signal?: AbortSignal }} options
  * @returns {Promise<{ ok: true, blocked: boolean, retried: boolean, turnCapped?: boolean } | { ok: false, error: string, retried: boolean, rateLimited?: boolean, detail?: string, turnCap?: boolean, cancelled?: boolean }>}
  */
-async function runWorker({ workdir, logDir, verdictPath, prompt, timeoutSeconds, signal }) {
+async function runWorker({ workdir, logDir, verdictPath, prompt, timeoutSeconds, chunkChars, signal }) {
   const worker = workerCommand();
-  const maxTurns = maxTurnsFromEnv();
+  const maxTurns = maxTurnsFor(chunkChars);
   const noRetry429 = noRetry429FromEnv();
   let lastFailure = null;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
@@ -499,7 +499,7 @@ export async function review({
   label = "",
   blocking,
   workdir = null,
-  maxChars = DIFF_REVIEW_CHUNK_CHARS,
+  maxChars = chunkCharsFromEnv(),
   head = null,
   delta = null,
 }) {
@@ -603,6 +603,7 @@ export async function review({
         verdictPath,
         prompt,
         timeoutSeconds: workerTimeoutSeconds(row.chars),
+        chunkChars: row.chars,
         signal: controller.signal,
       });
       if (run.ok === false && run.rateLimited === true && rateLimit.hit === null) {
@@ -621,7 +622,7 @@ export async function review({
         ? mergeVerdicts(results)
         : {
             ok: false,
-            error: `ERROR: rate limited (429) in chunk ${rateLimit.hit.index}: ${rateLimit.hit.detail}`,
+            error: `ERROR: rate limited (429) in chunk ${rateLimit.hit.index}: ${rateLimit.hit.detail} (weekly quota may be exhausted)`,
           };
   }
 

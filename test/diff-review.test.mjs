@@ -484,6 +484,20 @@ printf '%s\\n%s\\n' "\${ECO_WORKER_MAX_TURNS:-}" "\${ECO_WORKER_NO_RETRY_429:-}"
 printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
 `;
 
+// Needs one turn per 1000 characters of its chunk, as a real reviewer roughly does
+// (a 52K chunk needed more than 40 turns). Hits the cap like eco-worker does.
+const TURN_NEED_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf 'x\\n' >> "$out/attempts"
+bytes=$(wc -c < "$out/diff.patch")
+need=$(( (bytes + 999) / 1000 ))
+if [ "$need" -gt "\${ECO_WORKER_MAX_TURNS:?ECO_WORKER_MAX_TURNS missing}" ]; then
+  printf '%s\\n' '{"type":"result","subtype":"error_max_turns","is_error":true}' > "$out/run.log"
+  exit 1
+fi
+printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
+`;
+
 describe("review: quota guards", () => {
   let scriptsDir;
   let previousWorker;
@@ -581,6 +595,57 @@ describe("review: quota guards", () => {
     expect(readFileSync(result.verdictMd, "utf8")).toContain("turn cap reached, but verdict.json is valid");
   });
 
+  describe("a 52K chunk (planted: the old fixed 40-turn cap)", () => {
+    // 52 hunks of about 1000 characters in one file: one chunk of about 52K.
+    function bigDiff() {
+      const hunks = Array.from(
+        { length: 52 },
+        (_, i) => `@@ -${i * 2 + 1} +${i * 2 + 1} @@\n-a\n+${"x".repeat(960)}`,
+      );
+      return `${fileSection("src/big.js", hunks)}\n`;
+    }
+
+    async function run(prefix, extra) {
+      process.env.DIFF_REVIEW_WORKER = script("turn-need.sh", TURN_NEED_WORKER);
+      const repo = makeRepo(prefix);
+      return review({
+        diff: bigDiff(),
+        base: "main",
+        rules: defaultRules(),
+        outDir: join(repo, ".diff-review"),
+        blocking: false,
+        workdir: repo,
+        ...extra,
+      });
+    }
+
+    it("is an ERROR under the old settings (one 60K chunk, fixed cap of 40)", async () => {
+      process.env.DIFF_REVIEW_MAX_TURNS = "40";
+      try {
+        const result = await run("old-settings-", { maxChars: 60000 });
+        expect(bigDiff().length).toBeGreaterThan(50000);
+        expect(result.parsed.ok).toBe(false);
+        expect(readFileSync(result.verdictMd, "utf8")).toContain("## ERROR");
+      } finally {
+        delete process.env.DIFF_REVIEW_MAX_TURNS;
+      }
+    });
+
+    it("passes with the new settings on the same single chunk (derived cap)", async () => {
+      delete process.env.DIFF_REVIEW_MAX_TURNS;
+      const result = await run("new-cap-", { maxChars: 60000 });
+      expect(result.parsed).toMatchObject({ ok: true, verdict: "PASS" });
+    });
+
+    it("passes with the default chunk size, split into several chunks", async () => {
+      delete process.env.DIFF_REVIEW_MAX_TURNS;
+      delete process.env.DIFF_REVIEW_CHUNK_CHARS;
+      const result = await run("new-default-", {});
+      expect(result.parsed).toMatchObject({ ok: true, verdict: "PASS" });
+      expect(existsSync(join(result.dir, "chunks", "2"))).toBe(true);
+    });
+  });
+
   it("passes the turn cap and no-retry-429 settings to the worker, with env overrides", async () => {
     const worker = script("env.sh", ENV_WORKER);
     process.env.DIFF_REVIEW_WORKER = worker;
@@ -599,7 +664,7 @@ describe("review: quota guards", () => {
         blocking: false,
         workdir: repo,
       });
-      expect(readFileSync(join(result.dir, "env.txt"), "utf8").trim().split("\n")).toEqual(["40", "1"]);
+      expect(readFileSync(join(result.dir, "env.txt"), "utf8").trim().split("\n")).toEqual(["31", "1"]);
 
       process.env.DIFF_REVIEW_MAX_TURNS = "7";
       process.env.ECO_WORKER_NO_RETRY_429 = "0";
