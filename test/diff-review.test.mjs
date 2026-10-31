@@ -809,7 +809,7 @@ describe("review: quota guards", () => {
         blocking: false,
         workdir: repo,
       });
-      expect(readFileSync(join(result.dir, "env.txt"), "utf8").trim().split("\n")).toEqual(["31", "1"]);
+      expect(readFileSync(join(result.dir, "env.txt"), "utf8").trim().split("\n")).toEqual(["41", "1"]);
 
       process.env.DIFF_REVIEW_MAX_TURNS = "7";
       process.env.ECO_WORKER_NO_RETRY_429 = "0";

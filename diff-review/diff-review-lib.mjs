@@ -74,15 +74,19 @@ export function concurrencyFromEnv(env = process.env) {
   return DEFAULT_CONCURRENCY;
 }
 
-/** Turns every chunk worker may take before the per-1000-character allowance. */
-export const MAX_TURNS_BASE = 30;
+/**
+ * Turns every chunk worker may take before the per-1000-character allowance;
+ * 40 was the old fixed cap, so a small chunk never gets fewer turns than before.
+ */
+export const MAX_TURNS_BASE = 40;
 /** Extra turns allowed for every 1000 characters of the chunk. */
 export const MAX_TURNS_PER_1000_CHARS = 1;
 
 /**
  * The per-chunk turn cap. A positive integer DIFF_REVIEW_MAX_TURNS wins;
- * otherwise it is derived from the chunk size (30 + 1 per 1000 characters), so
- * a default run cannot hit the cap on its own chunking. The cap is passed to
+ * otherwise it is derived from the chunk size (40 + 1 per started 1000
+ * characters): a bigger chunk needs more reads, so it gets more turns. This
+ * does not guarantee a reviewer finishes within the cap. The cap is passed to
  * eco-worker as ECO_WORKER_MAX_TURNS; a chunk that reaches it without a valid
  * verdict is an ERROR, never a PASS.
  * @param {number} chunkChars characters in the chunk.

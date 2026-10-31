@@ -576,10 +576,17 @@ describe("concurrencyFromEnv", () => {
 
 describe("maxTurnsFor", () => {
   it("scales the default cap with the chunk size", () => {
-    expect(maxTurnsFor(20000, {})).toBe(50);
-    expect(maxTurnsFor(51844, {})).toBe(82);
-    expect(maxTurnsFor(60000, {})).toBe(90);
-    expect(maxTurnsFor(0, {})).toBe(30);
+    expect(maxTurnsFor(20000, {})).toBe(60);
+    expect(maxTurnsFor(51844, {})).toBe(92);
+    expect(maxTurnsFor(60000, {})).toBe(100);
+    expect(maxTurnsFor(0, {})).toBe(40);
+  });
+
+  it("never gives a small chunk fewer than the old fixed 40 turns", () => {
+    for (const n of [0, 1, 500, 5000, 9000]) {
+      expect(maxTurnsFor(n, {})).toBeGreaterThanOrEqual(40);
+    }
+    expect(maxTurnsFor(5000, {})).toBe(45);
   });
 
   it("lets a positive integer DIFF_REVIEW_MAX_TURNS win", () => {
@@ -587,9 +594,9 @@ describe("maxTurnsFor", () => {
   });
 
   it("ignores a non-positive or non-numeric override", () => {
-    expect(maxTurnsFor(20000, { DIFF_REVIEW_MAX_TURNS: "0" })).toBe(50);
-    expect(maxTurnsFor(20000, { DIFF_REVIEW_MAX_TURNS: "-3" })).toBe(50);
-    expect(maxTurnsFor(20000, { DIFF_REVIEW_MAX_TURNS: "many" })).toBe(50);
+    expect(maxTurnsFor(20000, { DIFF_REVIEW_MAX_TURNS: "0" })).toBe(60);
+    expect(maxTurnsFor(20000, { DIFF_REVIEW_MAX_TURNS: "-3" })).toBe(60);
+    expect(maxTurnsFor(20000, { DIFF_REVIEW_MAX_TURNS: "many" })).toBe(60);
   });
 });
 

@@ -648,7 +648,7 @@ export async function review({
         ? mergeVerdicts(results)
         : {
             ok: false,
-            error: `ERROR: rate limited (429) in chunk ${rateLimit.hit.index}: ${rateLimit.hit.detail} (weekly quota may be exhausted)`,
+            error: `ERROR: rate limited (429) in chunk ${rateLimit.hit.index}: ${rateLimit.hit.detail}`,
           };
   }
 
