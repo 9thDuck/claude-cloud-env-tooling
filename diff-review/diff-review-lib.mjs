@@ -815,12 +815,14 @@ export function allowedBashCommands(permissions) {
 }
 
 /**
- * The reviewer's permissions for one run: a `-C <root>` twin of every
- * `Bash(git ...)` allow rule, so the reviewer (whose cwd is its chunk's run
- * directory, not the repo root) can run read-only git against the repository
- * under review. Only that root and only allow-listed subcommands get a twin,
- * so any other -C path or a write subcommand is refused. Deny rules are
- * copied; the input is not mutated.
+ * The reviewer's permissions for one run: three twins of every `Bash(git ...)`
+ * allow rule — `-C <root>`, `--no-pager`, and `--no-pager -C <root>` — so the
+ * reviewer (whose cwd is its chunk's run directory, not the repo root) can run
+ * read-only git against the repository under review. The `--no-pager` twins
+ * exist because `git --no-pager diff ...` does not match `Bash(git diff:*)`,
+ * and that refusal turned a review into an ERROR. Only that root and only
+ * allow-listed subcommands get a twin, so any other -C path or a write
+ * subcommand is refused. Deny rules are copied; the input is not mutated.
  * @param {{ permissions: { allow: unknown[], deny: unknown[] } }} permissions parsed permissions JSON.
  * @param {string} root the repository root under review.
  * @returns {Record<string, any>} a new permissions object.
@@ -834,11 +836,15 @@ export function reviewerPermissionsFor(permissions, root) {
   if (!Array.isArray(source.deny)) {
     throw new Error("reviewer permissions have no permissions.deny list");
   }
-  const twins = source.allow.flatMap((rule) =>
-    typeof rule === "string" && rule.startsWith("Bash(git ")
-      ? [`Bash(git -C ${root} ${rule.slice("Bash(git ".length)}`]
-      : [],
-  );
+  const twins = source.allow.flatMap((rule) => {
+    if (typeof rule !== "string" || !rule.startsWith("Bash(git ")) return [];
+    const rest = rule.slice("Bash(git ".length);
+    return [
+      `Bash(git -C ${root} ${rest}`,
+      `Bash(git --no-pager ${rest}`,
+      `Bash(git --no-pager -C ${root} ${rest}`,
+    ];
+  });
   const merged = { ...source, allow: [...source.allow, ...twins], deny: [...source.deny] };
   return { ...permissions, permissions: merged };
 }

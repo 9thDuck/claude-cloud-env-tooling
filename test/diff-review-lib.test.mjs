@@ -1,4 +1,9 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
+
+import { commandAllowed } from "./bash-rule-matches.mjs";
 
 import {
   DIFF_REVIEW_CHUNK_CHARS,
@@ -124,7 +129,25 @@ describe("allowedBashCommands", () => {
   });
 });
 
+// The real rules the reviewer is given, so these cases test what ships.
+const shippedPermissions = JSON.parse(
+  readFileSync(join(import.meta.dirname, "..", "diff-review", "reviewer-permissions.json"), "utf8"),
+);
+
 describe("reviewerPermissionsFor", () => {
+  it("allows git --no-pager and git --no-pager -C <root> read-only commands", () => {
+    const permissions = reviewerPermissionsFor(shippedPermissions, "/repo");
+    expect(commandAllowed(permissions, "git --no-pager diff origin/main...HEAD")).toBe(true);
+    expect(commandAllowed(permissions, "git --no-pager -C /repo log --oneline -3")).toBe(true);
+  });
+
+  it("refuses git --no-pager and -C outside the reviewed root", () => {
+    const permissions = reviewerPermissionsFor(shippedPermissions, "/repo");
+    expect(commandAllowed(permissions, "git --no-pager push origin main")).toBe(false);
+    expect(commandAllowed(permissions, "git --no-pager -C /other log")).toBe(false);
+    expect(commandAllowed(permissions, "git -C /other log")).toBe(false);
+  });
+
   it("throws when permissions.allow is missing", () => {
     expect(() => reviewerPermissionsFor({ permissions: { deny: [] } }, "/repo")).toThrow(
       /permissions\.allow/,

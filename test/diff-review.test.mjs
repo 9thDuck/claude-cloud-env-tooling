@@ -32,6 +32,7 @@ import {
   stateDir,
   workerCommand,
 } from "../diff-review/diff-review.mjs";
+import { commandAllowed } from "./bash-rule-matches.mjs";
 
 const WORK = resolve(import.meta.dirname, "..", ".work");
 let dir;
@@ -65,19 +66,6 @@ function fileSection(path, hunks = ["@@ -1 +1 @@\n-a\n+b"]) {
     ...hunks,
   ].join("\n");
 }
-
-// Claude Code Bash rules: `Bash(p:*)` matches p or a command starting with "p ",
-// `Bash(p)` only p; a deny match refuses, else an allow match allows.
-function bashRuleMatches(rule, command) {
-  const body = /^Bash\((.+)\)$/.exec(rule)?.[1];
-  if (body === undefined) return false;
-  const prefix = body.endsWith(":*") ? body.slice(0, -2) : null;
-  return prefix === null ? command === body : command === prefix || command.startsWith(`${prefix} `);
-}
-
-const commandAllowed = (permissions, command) =>
-  !permissions.permissions.deny.some((rule) => bashRuleMatches(rule, command)) &&
-  permissions.permissions.allow.some((rule) => bashRuleMatches(rule, command));
 
 // Proves what the worker may read: it reads app.js, a repo file outside the
 // diff, from the root its -a "Read(/<root>/**)" rule grants, and writes its
@@ -558,6 +546,7 @@ describe("review: repo read access and chunking", () => {
     expect(result.stdout).toContain("diff-review: FAIL (advisory) 1 finding");
     expect(result.stdout).toContain("verdict:");
   });
+
 
   it("is a setup ERROR naming the git failure when the repository has no HEAD", () => {
     const repo = mkdtempSync(join(WORK, "no-head-"));
