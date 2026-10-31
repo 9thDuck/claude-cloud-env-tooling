@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  DEFAULT_MAX_TURNS,
   DIFF_REVIEW_CHUNK_CHARS,
   blockingFromEnv,
   buildPrompt,
@@ -11,7 +10,8 @@ import {
   deltaReview,
   fileRank,
   filesInDiff,
-  maxTurnsFromEnv,
+  maxTurnsFor,
+  chunkCharsFromEnv,
   mergeVerdicts,
   noRetry429FromEnv,
   parseConfig,
@@ -288,12 +288,11 @@ describe("splitDiff", () => {
 });
 
 describe("DIFF_REVIEW_CHUNK_CHARS", () => {
-  it("defaults review chunks to 60,000 characters, below the old 200,000 limit", () => {
-    expect(DIFF_REVIEW_CHUNK_CHARS).toBe(60000);
-    // Three files of about 48k each (a 24k removal plus a 24k addition), about
-    // 144k in total: under the old 200k limit, and one chunk per file under the
-    // review target. The worker timeout grows with a chunk.
-    const big = () => `@@ -1 +1 @@\n-${"x".repeat(24000)}\n+${"y".repeat(24000)}`;
+  it("defaults review chunks to 20,000 characters, below the old 200,000 limit", () => {
+    expect(DIFF_REVIEW_CHUNK_CHARS).toBe(20000);
+    // Three ~18k files: 54k total, so one chunk under the old 200k default and
+    // several chunks under the review target. The worker timeout grows with a chunk.
+    const big = () => `@@ -1 +1 @@\n-${"x".repeat(9000)}\n+${"y".repeat(9000)}`;
     const diff = ["src/a.js", "src/b.js", "src/c.js"].map((path) => fileSection(path, [big()])).join("\n");
     expect(diff.length).toBeGreaterThan(DIFF_REVIEW_CHUNK_CHARS);
     expect(diff.length).toBeLessThan(200000);
@@ -575,17 +574,41 @@ describe("concurrencyFromEnv", () => {
   });
 });
 
-describe("maxTurnsFromEnv", () => {
-  it("defaults to 40 and takes a positive integer override", () => {
-    expect(DEFAULT_MAX_TURNS).toBe(40);
-    expect(maxTurnsFromEnv({})).toBe(40);
-    expect(maxTurnsFromEnv({ DIFF_REVIEW_MAX_TURNS: "7" })).toBe(7);
+describe("maxTurnsFor", () => {
+  it("scales the default cap with the chunk size", () => {
+    expect(maxTurnsFor(20000, {})).toBe(60);
+    expect(maxTurnsFor(51844, {})).toBe(92);
+    expect(maxTurnsFor(60000, {})).toBe(100);
+    expect(maxTurnsFor(0, {})).toBe(40);
   });
 
-  it("ignores a malformed or zero cap", () => {
-    expect(maxTurnsFromEnv({ DIFF_REVIEW_MAX_TURNS: "0" })).toBe(40);
-    expect(maxTurnsFromEnv({ DIFF_REVIEW_MAX_TURNS: "-3" })).toBe(40);
-    expect(maxTurnsFromEnv({ DIFF_REVIEW_MAX_TURNS: "many" })).toBe(40);
+  it("never gives a small chunk fewer than the old fixed 40 turns", () => {
+    for (const n of [0, 1, 500, 5000, 9000]) {
+      expect(maxTurnsFor(n, {})).toBeGreaterThanOrEqual(40);
+    }
+    expect(maxTurnsFor(5000, {})).toBe(45);
+  });
+
+  it("lets a positive integer DIFF_REVIEW_MAX_TURNS win", () => {
+    expect(maxTurnsFor(51844, { DIFF_REVIEW_MAX_TURNS: "7" })).toBe(7);
+  });
+
+  it("ignores a non-positive or non-numeric override", () => {
+    expect(maxTurnsFor(20000, { DIFF_REVIEW_MAX_TURNS: "0" })).toBe(60);
+    expect(maxTurnsFor(20000, { DIFF_REVIEW_MAX_TURNS: "-3" })).toBe(60);
+    expect(maxTurnsFor(20000, { DIFF_REVIEW_MAX_TURNS: "many" })).toBe(60);
+  });
+});
+
+describe("chunkCharsFromEnv", () => {
+  it("defaults to 20000 and accepts a positive integer", () => {
+    expect(chunkCharsFromEnv({})).toBe(20000);
+    expect(chunkCharsFromEnv({ DIFF_REVIEW_CHUNK_CHARS: "8000" })).toBe(8000);
+  });
+
+  it("ignores a bad value", () => {
+    expect(chunkCharsFromEnv({ DIFF_REVIEW_CHUNK_CHARS: "0" })).toBe(20000);
+    expect(chunkCharsFromEnv({ DIFF_REVIEW_CHUNK_CHARS: "big" })).toBe(20000);
   });
 });
 
