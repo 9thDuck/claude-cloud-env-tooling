@@ -56,6 +56,7 @@ def check(w):
         if sub in ("push","reset","stash","clean","rebase","restore","filter-branch","update-ref","send-pack"): return "git %s is not allowed for eco-worker" % sub
         if sub == "commit" and has(rest, "", ["--amend"]): return "git commit --amend rewrites a commit"
         if sub in ("checkout","switch") and has(rest, "f", ["--force","--discard-changes"]): return "git %s with a force flag discards work" % sub
+        if sub == "checkout" and "--" in rest: return "git checkout -- <path> discards work"
         if sub in ("fetch","pull","clone") and has(rest, "u", ["--upload-pack"]): return "git %s with --upload-pack runs a program" % sub
         if sub == "grep" and has(rest, "O", ["--open-files-in-pager"]): return "git grep -O runs a program"
     elif h == "rm":
