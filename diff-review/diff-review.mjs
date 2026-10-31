@@ -561,6 +561,9 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
         error: `the worker timed out (exit 124: the ${timeoutSeconds}s limit or eco-worker's stall watchdog; its log says which); not retried`,
         retried: attempt > 1,
       };
+    // A refusal ends the chunk here too: a retry would spend a second attempt
+    // to repeat a call that is already refused.
+    if (refusal !== null) return refusal;
     lastFailure = result.status === null ? `was killed by ${result.signal}` : `exited ${result.status}`;
     // Loud: a failed reviewer run is a failed review, never a quiet PASS.
     console.error(`[diff-review] FAILED: worker ${lastFailure} on attempt ${attempt}/2`);
