@@ -469,6 +469,8 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
         // The reviewer's read-only rule set with git -C <readRoot> twins, not the
         // builder's permissions.json.
         ECO_WORKER_PERMISSIONS: permissionsPath,
+        // git never opens a pager in the reviewer, so it has no reason to add --no-pager.
+        GIT_PAGER: "cat",
         ECO_WORKER_NO_RETRY_429: noRetry429 ? "1" : "0",
         ECO_WORKER_MAX_TURNS: String(maxTurns),
       },
