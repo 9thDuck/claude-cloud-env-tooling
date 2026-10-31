@@ -63,11 +63,10 @@ export const WORKER_TIMEOUT_STEP_CHARS = 50000;
 export const WORKER_TIMEOUT_MAX_SECONDS = 3600;
 
 /**
- * Seconds the turn-derived timeout allows per turn of the turn cap, so a run
- * whose turns take 30 seconds or less reaches the turn cap before the timeout.
- * The turn-derived timeout is capped at WORKER_TIMEOUT_TURN_MAX_SECONDS, and an
- * explicit DIFF_REVIEW_TIMEOUT_SECONDS wins over it; under either, a slow run
- * can hit the timeout before the cap.
+ * Seconds per turn of the turn cap in the turn term of workerTimeoutSeconds.
+ * The timeout is max(size formula, min(WORKER_TIMEOUT_TURN_MAX_SECONDS,
+ * maxTurns * this)), or DIFF_REVIEW_TIMEOUT_SECONDS when that is set. The
+ * timeout can fire before the turn cap is reached.
  */
 export const WORKER_TIMEOUT_SECONDS_PER_TURN = 30;
 /** The turn-derived timeout never exceeds this, whatever DIFF_REVIEW_MAX_TURNS says. */
@@ -77,10 +76,9 @@ export const WORKER_TIMEOUT_TURN_MAX_SECONDS = 7200;
  * Seconds to give the worker for a chunk of `chars` characters: the larger of
  * the size formula (600s base plus 600s per started 50,000 characters, capped
  * at 3600s) and 30s for every turn of the chunk's turn cap (capped at 7200s).
- * A larger chunk is read with more of the repository, and a raised turn cap
- * must not be cut off by a timeout sized for the old one: a timeout is not
- * retried, so a run that times out is spent quota with no verdict. An explicit
- * DIFF_REVIEW_TIMEOUT_SECONDS (a positive integer) wins over both.
+ * The turn term makes the timeout grow with the turn cap. A timeout is not
+ * retried, so a run that times out spends quota and gives no verdict. An
+ * explicit DIFF_REVIEW_TIMEOUT_SECONDS (a positive integer) wins over both.
  * @param {number} chars chunk size in characters.
  * @param {Record<string, string | undefined>} env
  * @param {number} maxTurns the chunk's turn cap (maxTurnsFor).
