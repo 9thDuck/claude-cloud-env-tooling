@@ -263,6 +263,58 @@ describe("CLI: an empty diff in blocking mode", () => {
   });
 });
 
+// git prints a path that is not valid UTF-8 C-quoted, and decoding it throws.
+// That throw is a diff this tool cannot split, so the run must end in the same
+// fail-closed verdict as an empty diff: an ERROR verdict.md, one ERROR line and
+// a nonzero exit, never a stack trace with no verdict.
+describe("CLI: a diff whose path is not UTF-8", () => {
+  // Built by concatenation so the patch holds the backslash and digits git
+  // prints, not an escape the test file itself would decode.
+  function nonUtf8Patch(repo) {
+    const path = join(repo, "bad-path.patch");
+    writeFileSync(
+      path,
+      [
+        'diff --git "a/x\\377.txt" "b/x\\377.txt"',
+        "index 1111111..2222222 100644",
+        '--- "a/x\\377.txt"',
+        '+++ "b/x\\377.txt"',
+        "@@ -1 +1 @@",
+        "-a",
+        "+b",
+        "",
+      ].join("\n"),
+    );
+    return path;
+  }
+
+  function run(repo, patch, blocking) {
+    const env = { ...process.env, DIFF_REVIEW_WORKER: "/nonexistent-worker" };
+    if (blocking) env.DIFF_REVIEW_BLOCKING = "1";
+    else delete env.DIFF_REVIEW_BLOCKING;
+    return spawnSync(
+      "node",
+      [resolve(import.meta.dirname, "..", "diff-review", "diff-review.mjs"), "--diff-file", patch],
+      { cwd: repo, encoding: "utf8", env },
+    );
+  }
+
+  for (const blocking of [true, false]) {
+    it(`ends in an ERROR verdict with a verdict.md (${blocking ? "blocking" : "advisory"})`, () => {
+      const repo = makeRepo(`non-utf8-${blocking ? "blocking" : "advisory"}-`);
+      const result = run(repo, nonUtf8Patch(repo), blocking);
+      expect(result.status).not.toBe(0);
+      expect(result.stdout).toContain("ERROR");
+      expect(result.stdout).toContain("not UTF-8");
+      expect(result.stdout).not.toContain("    at ");
+      const runs = readdirSync(join(repo, ".diff-review")).filter((name) => name !== ".gitignore").sort();
+      expect(runs.length).toBe(1);
+      const verdict = readFileSync(join(repo, ".diff-review", runs[0], "verdict.md"), "utf8");
+      expect(verdict).toContain("ERROR");
+    });
+  }
+});
+
 // The CLI finds its tool files from its own path, so a copy of the tool with
 // its own XDG state is a complete installation. The state holds a fresh passing
 // self-test record, so the one file a test removes is the only fault --status
