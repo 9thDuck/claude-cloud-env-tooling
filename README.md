@@ -138,7 +138,8 @@ Only `ECO_WORKER_API_KEY` is required. Every other variable has a default.
 | `DIFF_REVIEW_WORKER` | the bundled `eco-worker` | The command that runs the review. It is called as `<cmd> -t <seconds> -d <repo root> "<prompt>"` with `ECO_WORKER_LOG_DIR` set to the run (or chunk) directory. |
 | `DIFF_REVIEW_TIMEOUT_SECONDS` | computed from the chunk | A positive integer that overrides the per-chunk worker timeout (formula and 3600s cap). The default is 600s plus 600s per started 50,000 characters, capped at 3600s. |
 | `DIFF_REVIEW_CONCURRENCY` | `2` | How many chunk reviewers run at the same time. Values below 1 are treated as 1; a non-numeric value uses the default. |
-| `DIFF_REVIEW_MAX_TURNS` | `40` | Assistant turns allowed per chunk, passed to the worker. A chunk that hits the cap without a valid verdict is an ERROR. |
+| `DIFF_REVIEW_MAX_TURNS` | derived: 30 + 1 per started 1,000 chars of the chunk | Assistant turns allowed per chunk, passed to the worker. A chunk that hits the cap without a valid verdict is an ERROR. |
+| `DIFF_REVIEW_CHUNK_CHARS` | `20000` | Target chunk size in characters. |
 | `INSTALL_BIN_DIR` | `~/.local/bin` | Where `install.sh` puts the links. |
 | `XDG_STATE_HOME` | `~/.local/state` | The self-test record is kept under `diff-review/` here. |
 

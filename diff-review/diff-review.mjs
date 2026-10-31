@@ -342,7 +342,7 @@ function spawnWorker(worker, args, options) {
  * the other chunks. A turn-cap report is not retried either; it is an ERROR
  * unless the leg still wrote a valid verdict. Both are read from eco-worker's
  * log/status files in `logDir`, and eco-worker runs with
- * ECO_WORKER_NO_RETRY_429=1 and ECO_WORKER_MAX_TURNS from the environment.
+ * ECO_WORKER_NO_RETRY_429=1 and ECO_WORKER_MAX_TURNS derived from the chunk size (maxTurnsFor).
  * `timeoutSeconds` scales with the chunk size: the reviewer reads the
  * repository, so a bigger chunk needs longer.
  * @param {{ workdir: string, logDir: string, verdictPath: string, prompt: string, timeoutSeconds: number, chunkChars: number, signal?: AbortSignal }} options
