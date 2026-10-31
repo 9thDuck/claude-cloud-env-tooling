@@ -12,9 +12,9 @@
  */
 
 /**
- * Largest diff (in characters) the reviewer is asked to read. The CLI writes
- * only this much to diff.patch and buildPrompt says so, so a reviewer never
- * believes it saw the whole change.
+ * Largest chunk (in characters) one reviewer run is asked to read. A bigger
+ * diff is split by file (and a bigger file by hunk) so every file is reviewed;
+ * see splitDiff. Nothing is truncated.
  */
 export const MAX_DIFF_CHARS = 200000;
 
@@ -34,6 +34,340 @@ export const KEEP_RUNS = 20;
 export function runsToPrune(names, keep = KEEP_RUNS) {
   const sorted = [...names].sort();
   return sorted.slice(0, Math.max(0, sorted.length - keep));
+}
+
+/** Directory prefixes whose files a reviewer should see first. */
+const FIRST_PREFIXES = ["src/", "e2e/", "scripts/", "config/", "test/", "tests/", "__tests__/"];
+
+/** Directory prefixes whose files a reviewer should see last. */
+const LAST_PREFIXES = ["docs/", ".beads/"];
+
+/**
+ * Review order for a file: source and tests first (0), docs and beads last (2),
+ * everything else between (1).
+ * @param {string} path repo-relative path.
+ * @returns {0 | 1 | 2}
+ */
+export function fileRank(path) {
+  const normalized = String(path).replace(/^\.\//, "");
+  if (LAST_PREFIXES.some((prefix) => normalized.startsWith(prefix))) return 2;
+  if (FIRST_PREFIXES.some((prefix) => normalized.startsWith(prefix))) return 0;
+  if (/(^|\/)(__tests__|test|tests|e2e|spec)\//.test(normalized)) return 0;
+  if (/\.(test|spec)\.[^/]+$/.test(normalized)) return 0;
+  return 1;
+}
+
+const C_ESCAPES = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+
+/**
+ * Decode git's C-style quoted path (core.quotePath): `\ooo` octal bytes and
+ * the escapes in C_ESCAPES, read as UTF-8.
+ * @param {string} quoted the path with its surrounding quotes.
+ * @returns {string}
+ * @throws {Error} on an escape git does not write or bytes that are not UTF-8.
+ */
+function unquoteC(quoted) {
+  const bytes = [];
+  const body = quoted.slice(1, -1);
+  for (let index = 0; index < body.length; index += 1) {
+    const char = body[index];
+    if (char !== "\\") {
+      bytes.push(...new TextEncoder().encode(char));
+      continue;
+    }
+    const octal = /^[0-7]{3}/.exec(body.slice(index + 1));
+    if (octal !== null) {
+      bytes.push(Number.parseInt(octal[0], 8));
+      index += 3;
+      continue;
+    }
+    const code = C_ESCAPES[body[index + 1]];
+    if (code === undefined) throw new Error(`diff-review: cannot unquote git path ${quoted}`);
+    bytes.push(code);
+    index += 1;
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(bytes));
+  } catch {
+    throw new Error(`diff-review: git path ${quoted} is not UTF-8`);
+  }
+}
+
+/**
+ * A git path from a header, removing the a/ or b/ prefix and quotes.
+ * @param {string} value e.g. `b/src/a.js` or `"b/caf\\303\\251.js"`.
+ * @returns {string}
+ */
+function unquotePath(value) {
+  const path = value.startsWith('"') && value.endsWith('"') ? unquoteC(value) : value;
+  return path.replace(/^[ab]\//, "");
+}
+
+/**
+ * The target path from a `diff --git a/<old> b/<new>` header. Null when the
+ * line cannot be parsed.
+ * @param {string} line
+ * @returns {string | null}
+ */
+function pathFromGitHeader(line) {
+  const rest = line.slice("diff --git ".length);
+  const quoted = /^("(?:[^"\\]|\\.)*") ("(?:[^"\\]|\\.)*")$/.exec(rest);
+  if (quoted !== null) return unquotePath(quoted[2]);
+  const at = rest.indexOf(" b/");
+  return at > 0 ? unquotePath(rest.slice(at + 1)) : null;
+}
+
+/**
+ * The path a file section describes: the `+++` line (or `---` for a deletion),
+ * else the `diff --git` header. Null when the section names no file.
+ * @param {string} text one file section.
+ * @returns {string | null}
+ */
+function sectionPath(text) {
+  for (const line of text.split("\n")) {
+    if (line.startsWith("+++ ")) {
+      const value = unquotePath(line.slice(4).split("\t")[0]);
+      if (value !== "/dev/null") return value;
+    }
+  }
+  for (const line of text.split("\n")) {
+    if (line.startsWith("--- ")) {
+      const value = unquotePath(line.slice(4).split("\t")[0]);
+      if (value !== "/dev/null") return value;
+    }
+  }
+  const header = text.split("\n").find((line) => line.startsWith("diff --git "));
+  return header === undefined ? null : pathFromGitHeader(header);
+}
+
+/**
+ * Split a unified diff into per-file sections, preserving every byte.
+ * Sections start at `diff --git`; a plain `diff -u` header without it is also
+ * recognised. Hunk line counts are tracked, so a removed line that looks like a
+ * header is never mistaken for one and the next file's header is found after
+ * the last hunk.
+ * @param {string} diff
+ * @returns {Array<{ path: string | null, text: string }>}
+ */
+export function splitFileSections(diff) {
+  if (typeof diff !== "string" || diff.length === 0) return [];
+  const lines = diff.split("\n");
+  const sections = [];
+  let current = null;
+  let oldLeft = 0;
+  let newLeft = 0;
+  const start = (line) => {
+    current = { lines: line === null ? [] : [line] };
+    sections.push(current);
+    oldLeft = 0;
+    newLeft = 0;
+  };
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line.startsWith("diff --git ")) {
+      start(line);
+      continue;
+    }
+    const inHunk = oldLeft > 0 || newLeft > 0;
+    if (!inHunk && line.startsWith("--- ") && /^\+\+\+ /.test(lines[index + 1] ?? "")) {
+      const ownHeader = current !== null && current.lines.some((entry) => entry.startsWith("+++ "));
+      if (current === null || ownHeader) {
+        start(line);
+        continue;
+      }
+    }
+    if (current === null) start(null);
+    current.lines.push(line);
+    const hunk = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(line);
+    if (!inHunk && hunk !== null) {
+      // Unified diff omits ",count" when the count is 1, so an absent group means 1.
+      oldLeft = Number(hunk[1] ?? 1);
+      newLeft = Number(hunk[2] ?? 1);
+    } else if (inHunk) {
+      if (line.startsWith(" ") || line === "") {
+        oldLeft -= 1;
+        newLeft -= 1;
+      } else if (line.startsWith("-")) oldLeft -= 1;
+      else if (line.startsWith("+")) newLeft -= 1;
+    }
+  }
+  return sections.map((section) => {
+    const text = section.lines.join("\n");
+    return { path: sectionPath(text), text };
+  });
+}
+
+/**
+ * Every file the diff names, in first-seen order. This reads `diff --git`
+ * headers itself, independently of splitFileSections, so a splitter bug shows
+ * up as a coverage ERROR instead of hiding. A plain `diff -u` patch with no
+ * such headers falls back to the section parser.
+ * @param {string} diff
+ * @returns {string[]}
+ */
+export function filesInDiff(diff) {
+  if (typeof diff !== "string" || diff.length === 0) return [];
+  const fromHeaders = [];
+  for (const line of diff.split("\n")) {
+    if (!line.startsWith("diff --git ")) continue;
+    const path = pathFromGitHeader(line);
+    if (path !== null && !fromHeaders.includes(path)) fromHeaders.push(path);
+  }
+  if (fromHeaders.length > 0) return fromHeaders;
+  const seen = new Set();
+  for (const section of splitFileSections(diff)) {
+    if (section.path !== null) seen.add(section.path);
+  }
+  return [...seen];
+}
+
+/**
+ * Split one oversized file section by hunk, repeating the file header in every
+ * piece so each piece is a valid standalone diff. A single hunk bigger than the
+ * limit is kept whole and marked oversize: cutting lines out of a hunk would
+ * silently drop context.
+ * @param {{ path: string | null, text: string }} section
+ * @param {number} maxChars
+ * @returns {Array<{ text: string, files: string[], oversize: boolean }>}
+ */
+function splitSectionByHunks(section, maxChars) {
+  const lines = section.text.split("\n");
+  const firstHunk = lines.findIndex((line) => line.startsWith("@@ "));
+  if (firstHunk === -1) {
+    return [
+      {
+        text: section.text,
+        files: section.path === null ? [] : [section.path],
+        oversize: section.text.length > maxChars,
+      },
+    ];
+  }
+  const header = lines.slice(0, firstHunk).join("\n");
+  const hunks = [];
+  let current = [];
+  for (const line of lines.slice(firstHunk)) {
+    if (line.startsWith("@@ ") && current.length > 0) {
+      hunks.push(current.join("\n"));
+      current = [];
+    }
+    current.push(line);
+  }
+  if (current.length > 0) hunks.push(current.join("\n"));
+  const pieces = [];
+  let body = "";
+  for (const hunk of hunks) {
+    const candidate = body === "" ? hunk : `${body}\n${hunk}`;
+    if (body !== "" && `${header}\n${candidate}`.length > maxChars) {
+      pieces.push(`${header}\n${body}`);
+      body = hunk;
+    } else {
+      body = candidate;
+    }
+  }
+  if (body !== "") pieces.push(`${header}\n${body}`);
+  return pieces.map((text) => ({
+    text,
+    files: section.path === null ? [] : [section.path],
+    oversize: text.length > maxChars,
+  }));
+}
+
+/**
+ * Split a diff into reviewable chunks, ordered source/tests first and docs and
+ * .beads last. Whole files are packed under `maxChars`; a file bigger than that
+ * is split by hunk. Every file appears in at least one chunk.
+ * @param {string} diff
+ * @param {{ maxChars?: number }} [options]
+ * @returns {{ chunks: Array<{ text: string, files: string[], oversize: boolean }>, files: string[] }}
+ */
+export function splitDiff(diff, { maxChars = MAX_DIFF_CHARS } = {}) {
+  if (!Number.isInteger(maxChars) || maxChars <= 0)
+    throw new Error("maxChars must be a positive integer");
+  const sections = splitFileSections(diff)
+    .map((section, order) => ({
+      ...section,
+      order,
+      rank: section.path === null ? 1 : fileRank(section.path),
+    }))
+    .sort((left, right) => {
+      if (left.rank !== right.rank) return left.rank - right.rank;
+      const leftPath = left.path ?? "";
+      const rightPath = right.path ?? "";
+      if (leftPath !== rightPath) return leftPath < rightPath ? -1 : 1;
+      return left.order - right.order;
+    });
+  const chunks = [];
+  let text = "";
+  let files = [];
+  const flush = () => {
+    if (text === "") return;
+    chunks.push({ text, files: [...new Set(files)], oversize: text.length > maxChars });
+    text = "";
+    files = [];
+  };
+  for (const section of sections) {
+    const sectionFiles = section.path === null ? [] : [section.path];
+    const joined = text === "" ? section.text : `${text}\n${section.text}`;
+    if (joined.length <= maxChars) {
+      text = joined;
+      files.push(...sectionFiles);
+      continue;
+    }
+    flush();
+    if (section.text.length <= maxChars) {
+      text = section.text;
+      files = [...sectionFiles];
+      continue;
+    }
+    for (const piece of splitSectionByHunks(section, maxChars)) {
+      flush();
+      chunks.push({ text: piece.text, files: [...new Set(piece.files)], oversize: piece.oversize });
+    }
+  }
+  flush();
+  return { chunks, files: filesInDiff(diff) };
+}
+
+/**
+ * Why the chunks do not cover every file in the diff. Empty means complete;
+ * anything else must fail the run as ERROR, never a quiet PASS.
+ * @param {string} diff
+ * @param {Array<{ files: string[] }>} chunks
+ * @returns {string[]}
+ */
+export function coverageProblems(diff, chunks) {
+  const expected = filesInDiff(diff);
+  const covered = chunks.flatMap((chunk) => chunk.files ?? []);
+  const problems = [];
+  if (diff.trim().length > 0 && expected.length === 0)
+    problems.push("the diff has no recognizable file headers, so file coverage cannot be verified");
+  for (const file of expected)
+    if (!covered.includes(file)) problems.push(`file ${file} is in the diff but no chunk covers it`);
+  for (const file of new Set(covered))
+    if (!expected.includes(file)) problems.push(`a chunk covers ${file}, which is not a file in the diff`);
+  return problems;
+}
+
+/**
+ * Merge per-chunk verdicts: any chunk ERROR makes the whole review an ERROR;
+ * otherwise any FAIL makes it FAIL; otherwise PASS. Findings and untested items
+ * are kept, with the chunk number on each untested entry.
+ * @param {Array<{ index: number, parsed: ReturnType<typeof parseVerdict> }>} results
+ * @returns {{ ok: true, verdict: "PASS" | "FAIL", findings: Array<object>, untested: string[] } | { ok: false, error: string }}
+ */
+export function mergeVerdicts(results) {
+  if (!Array.isArray(results) || results.length === 0)
+    return { ok: false, error: "no chunk verdicts to merge" };
+  const findings = [];
+  const untested = [];
+  let fail = false;
+  for (const { index, parsed } of results) {
+    if (parsed.ok === false) return { ok: false, error: `chunk ${index}: ${parsed.error}` };
+    findings.push(...parsed.findings);
+    untested.push(...parsed.untested.map((entry) => `chunk ${index}: ${entry}`));
+    if (parsed.verdict === "FAIL") fail = true;
+  }
+  return { ok: true, verdict: fail ? "FAIL" : "PASS", findings, untested };
 }
 
 /**
@@ -105,30 +439,51 @@ export const DECIDED_COPY = "./decided.md";
 
 /**
  * The task the reviewer is given.
- * @param {{ diff: string, base: string, rules: string[], decided?: boolean, project?: string | null }} options
- *   `diff` is the full diff; over MAX_DIFF_CHARS only its head is written to ./diff.patch, and the prompt says so.
- *   `rules` are the rule file paths (as in the config). `decided` is true when a decided-items file was copied.
+ * @param {{ base: string, rules?: string[], decided?: boolean, project?: string | null, chunk?: { text: string, files: string[] }, chunkIndex?: number, chunkCount?: number, diffPath?: string, verdictPath?: string, rulePaths?: string[], decidedPath?: string | null, workdir?: string }} options
+ *   `chunk` is this run's complete patch; `diffPath`, `verdictPath` and
+ *   `rulePaths` are absolute paths (the worker's cwd is the repository root, not
+ *   the run directory). `rules` names the rule files when `rulePaths` is absent.
  * @returns {string} the prompt for the worker.
  */
-export function buildPrompt({ diff, base, rules, decided = false, project = null }) {
-  const length = typeof diff === "string" ? diff.length : 0;
-  const truncated = length > MAX_DIFF_CHARS;
-  const diffLine = truncated
-    ? `The change under review is a unified diff in ./diff.patch in your working directory. That file holds only the first ${MAX_DIFF_CHARS} of ${length} characters of the diff, so the rest is cut; judge what is there and name what you could not see under "untested".`
-    : `The change under review is a unified diff in ./diff.patch in your working directory (${length} characters, complete).`;
+export function buildPrompt({
+  base,
+  rules = [],
+  decided = false,
+  project = null,
+  chunk = { text: "", files: [] },
+  chunkIndex = 1,
+  chunkCount = 1,
+  diffPath = "./diff.patch",
+  verdictPath = "./verdict.json",
+  rulePaths = null,
+  decidedPath = null,
+  workdir = "the repository root",
+}) {
+  const text = typeof chunk.text === "string" ? chunk.text : "";
+  const files = Array.isArray(chunk.files) ? chunk.files : [];
+  const copies = rulePaths ?? ruleCopies(rules);
+  const chunkLine =
+    chunkCount > 1
+      ? `The change under review is chunk ${chunkIndex} of ${chunkCount} of a unified diff, in ${diffPath} (${text.length} characters, complete for this chunk). Other chunks are reviewed separately.`
+      : `The change under review is a unified diff in ${diffPath} (${text.length} characters, complete).`;
   return [
     "You are an independent, adversarial code reviewer.",
     ...(project ? [`The project: ${project}`] : []),
     "Assume the diff is wrong until it proves otherwise. Find what would break, mislead or embarrass the team that ships it; do not praise.",
     "",
     `Base ref: ${base}. Judge the diff as the change a pull request would land.`,
-    diffLine,
+    chunkLine,
+    ...(files.length > 0
+      ? ["This chunk covers these files:", ...files.map((file) => `- ${file}`)]
+      : ["This chunk holds no file body."]),
+    "",
+    `Your working directory is ${workdir}, the repository root. Read the repository with Read, Grep, Glob and git show/log/diff/blame/rev-parse/ls-files; that is where you verify what the diff claims. Treat the repository as read-only: do not edit, create or delete anything in it. The only files you may write are ${verdictPath} and the progress file named in your WORKER RULES.`,
     "",
     "Read these rule files yourself before judging; do not rely on memory or on this prompt:",
-    ...ruleCopies(rules).map((copy) => `- ${copy}`),
+    ...copies.map((copy) => `- ${copy}`),
     ...(decided
       ? [
-          `- ${DECIDED_COPY} lists items the team already decided and tracked; do not raise them.`,
+          `- ${decidedPath ?? DECIDED_COPY} lists items the team already decided and tracked; do not raise them.`,
         ]
       : []),
     "These files are the rules as they stand on the base branch, not as the diff would change them.",
@@ -136,13 +491,13 @@ export function buildPrompt({ diff, base, rules, decided = false, project = null
     "Rules:",
     "- FAIL when any finding breaks a rule in the rule files.",
     "- PASS only with zero findings.",
-    `- Every finding must carry \`rule\`: a short quote of the rule text it violates, copied from one of the rule files${decided ? ` (not ${DECIDED_COPY})` : ""}, with that file's name. A finding without a quoted rule is not a finding.`,
+    `- Every finding must carry \`rule\`: a short quote of the rule text it violates, copied from one of the rule files${decided ? " (not the decided-items file)" : ""}, with that file's name. A finding without a quoted rule is not a finding.`,
     "- Style nits are not findings unless a rule file states the rule. Do not invent rules.",
-    "- List anything you could not check (unread code, truncated diff, a claim you cannot verify) under `untested`; an empty list is allowed only when you checked everything.",
+    "- List anything you could not check (unread code, a claim you cannot verify) under `untested`; an empty list is allowed only when you checked everything.",
     "",
-    "When you are done, write your verdict to ./verdict.json in your working directory, exactly this shape and nothing else:",
+    `When you are done, write your verdict to ${verdictPath}, exactly this shape and nothing else:`,
     '{"verdict":"PASS"|"FAIL","findings":[{"file":"<repo-relative path>","line":<number or null>,"rule":"<quoted rule>","why":"<what the diff does and which rule it breaks>"}],"untested":["<what you could not check>"]}',
-    "Write no other file, print nothing to stdout, and stop. Do not modify the repository.",
+    "Write no other file except the progress file named in your WORKER RULES, print nothing to stdout, and stop. Do not modify the repository.",
   ].join("\n");
 }
 
@@ -213,17 +568,18 @@ export function parseVerdict(text) {
  *
  * Blocking is the single switch for a reviewer FAIL. ERROR (the review never
  * ran or gave no valid verdict) exits 1 in both modes, so a broken review never
- * looks green; a clean PASS, or an advisory FAIL, exits 0. A PASS on a
- * truncated diff is an ERROR in both modes: the reviewer never saw all of it.
- * @param {{ parsed: ReturnType<typeof parseVerdict>, blocking?: boolean, truncated?: boolean }} options
+ * looks green; a clean PASS, or an advisory FAIL, exits 0. A PASS when a chunk
+ * was larger than the chunk limit is an ERROR in both modes: the reviewer may
+ * not have read that chunk whole.
+ * @param {{ parsed: ReturnType<typeof parseVerdict>, blocking?: boolean, oversize?: boolean }} options
  * @returns {{ exitCode: 0 | 1, line: string }}
  */
-export function decide({ parsed, blocking, truncated = false }) {
+export function decide({ parsed, blocking, oversize = false }) {
   const mode = blocking === true ? "blocking" : "advisory";
-  if (parsed.ok === true && parsed.verdict === "PASS" && truncated === true) {
+  if (parsed.ok === true && parsed.verdict === "PASS" && oversize === true) {
     return {
       exitCode: 1,
-      line: `diff-review: ERROR (${mode}) the diff was cut at ${MAX_DIFF_CHARS} characters, so a PASS cannot stand; split the change into smaller pieces`,
+      line: `diff-review: ERROR (${mode}) a chunk was larger than the chunk limit, so the reviewer may not have read it whole and a PASS cannot stand; split the change into smaller pieces`,
     };
   }
   if (parsed.ok === false) {

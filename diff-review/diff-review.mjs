@@ -33,7 +33,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -42,11 +42,14 @@ import {
   MAX_DIFF_CHARS,
   blockingFromEnv,
   buildPrompt,
+  coverageProblems,
   decide,
+  mergeVerdicts,
   parseConfig,
   parseVerdict,
   ruleCopies,
   runsToPrune,
+  splitDiff,
 } from "./diff-review-lib.mjs";
 
 const TOOL_DIR = dirname(fileURLToPath(import.meta.url));
@@ -219,20 +222,27 @@ export function fixtureHashProblems(dir) {
 
 /**
  * Run the worker once, retrying once on a non-zero exit.
- * @param {string} dir working directory the reviewer treats as its own.
- * @param {string} prompt
+ *
+ * The worker's working directory is the repository root, so Read/Grep/Glob and
+ * read-only git work there. Its logs go to `logDir` (inside the run directory)
+ * through eco-worker's ECO_WORKER_LOG_DIR, and its verdict is written to the
+ * absolute `verdictPath` given in the prompt.
+ * @param {{ workdir: string, logDir: string, verdictPath: string, prompt: string }} options
  * @returns {{ ok: true, retried: boolean } | { ok: false, error: string, retried: boolean }}
  */
-function runWorker(dir, prompt) {
+function runWorker({ workdir, logDir, verdictPath, prompt }) {
   const worker = workerCommand();
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     // A retry must never read the previous attempt's verdict.
-    rmSync(join(dir, "verdict.json"), { force: true });
-    console.log(`[diff-review] worker attempt ${attempt}/2 (-d ${dir})`);
-    const result = spawnSync(worker, ["-t", TIMEOUT_SECONDS, "-d", dir, prompt], {
-      cwd: dir,
+    rmSync(verdictPath, { force: true });
+    console.log(
+      `[diff-review] worker attempt ${attempt}/2 (workdir ${workdir}, logs ${logDir})`,
+    );
+    const result = spawnSync(worker, ["-t", TIMEOUT_SECONDS, "-d", workdir, prompt], {
+      cwd: workdir,
       encoding: "utf8",
       stdio: "inherit",
+      env: { ...process.env, ECO_WORKER_LOG_DIR: logDir },
     });
     if (result.error)
       return {
@@ -248,83 +258,216 @@ function runWorker(dir, prompt) {
 }
 
 /**
+ * Read one chunk's verdict.json after its worker run. Errors are values, never
+ * exceptions: a missing or malformed file is an ERROR for that chunk.
+ * @param {string} verdictPath absolute path the prompt told the worker to write.
+ * @param {{ ok: true, retried: boolean } | { ok: false, error: string, retried: boolean }} run
+ * @returns {{ parsed: ReturnType<typeof parseVerdict>, workerNote: string }}
+ */
+function readChunkVerdict(verdictPath, run) {
+  if (!run.ok) {
+    return { parsed: { ok: false, error: run.error }, workerNote: `ERROR: ${run.error}` };
+  }
+  if (!existsSync(verdictPath)) {
+    // Never trust the worker's stdout; a run that wrote no file reviewed nothing.
+    const parsed = {
+      ok: false,
+      error: `the worker exited 0 but wrote no verdict.json (${verdictPath})`,
+    };
+    return { parsed, workerNote: `ERROR: ${parsed.error}` };
+  }
+  let parsed;
+  try {
+    parsed = parseVerdict(readFileSync(verdictPath, "utf8"));
+  } catch (error) {
+    parsed = { ok: false, error: `verdict.json could not be read: ${error.message}` };
+  }
+  return { parsed, workerNote: run.retried ? "exited non-zero once; the retry succeeded" : "exit 0" };
+}
+
+/**
  * Review one diff and leave the evidence on disk.
- * @param {{ diff: string, base: string, rules: ReturnType<typeof loadRules>, outDir: string, label?: string, blocking: boolean }} options
- *   `outDir` holds one directory per run; the oldest are pruned.
+ *
+ * A diff over MAX_DIFF_CHARS is split into chunks (splitDiff); each chunk gets
+ * its own worker run in `<run>/chunks/<n>/`, with the repository root as the
+ * worker's working directory so it can read the code the diff talks about. The
+ * verdicts are merged (any chunk ERROR => ERROR, else any FAIL => FAIL), and a
+ * chunk set that does not cover every file in the diff is an ERROR.
+ * @param {{ diff: string, base: string, rules: ReturnType<typeof loadRules>, outDir: string, label?: string, blocking: boolean, workdir?: string, maxChars?: number }} options
+ *   `outDir` holds one directory per run; the oldest are pruned. `workdir` is
+ *   the repository root (defaults to `outDir` for the self-test).
  * @returns {{ parsed: ReturnType<typeof parseVerdict>, decision: ReturnType<typeof decide>, dir: string, verdictMd: string }}
  */
-export function review({ diff, base, rules, outDir, label = "", blocking }) {
-  mkdirSync(outDir, { recursive: true });
+export function review({
+  diff,
+  base,
+  rules,
+  outDir,
+  label = "",
+  blocking,
+  workdir = null,
+  maxChars = MAX_DIFF_CHARS,
+}) {
+  const runsDir = resolve(outDir);
+  mkdirSync(runsDir, { recursive: true });
   // Run files must not show up in the repo's git status or the next review's diff.
-  if (!existsSync(join(outDir, ".gitignore"))) writeFileSync(join(outDir, ".gitignore"), "*\n");
-  const dir = join(outDir, stamp(label));
+  if (!existsSync(join(runsDir, ".gitignore"))) writeFileSync(join(runsDir, ".gitignore"), "*\n");
+  const dir = resolve(join(runsDir, stamp(label)));
   mkdirSync(dir, { recursive: true });
-  const names = readdirSync(outDir, { withFileTypes: true })
+  const names = readdirSync(runsDir, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name);
-  for (const old of runsToPrune(names)) rmSync(join(outDir, old), { recursive: true });
-  writeFileSync(join(dir, "diff.patch"), diff.slice(0, MAX_DIFF_CHARS));
+  for (const old of runsToPrune(names)) rmSync(join(runsDir, old), { recursive: true });
 
-  let run;
+  const runWorkdir = resolve(workdir ?? runsDir);
+  // The whole diff stays as evidence; each chunk gets its own patch file.
+  writeFileSync(join(dir, "diff.patch"), diff);
+  const split = splitDiff(diff, { maxChars });
+  const coverage = coverageProblems(diff, split.chunks);
+  const chunkRows = split.chunks.map((chunk, index) => {
+    const chunkIndex = index + 1;
+    const chunkDir =
+      split.chunks.length === 1 ? dir : resolve(join(dir, "chunks", String(chunkIndex)));
+    return {
+      index: chunkIndex,
+      chunk,
+      dir: chunkDir,
+      files: chunk.files,
+      chars: chunk.text.length,
+      oversize: chunk.oversize === true,
+      parsed: null,
+      workerNote: "not run",
+    };
+  });
+
+  let ruleFiles = [];
+  let decidedPath = null;
   if (rules.ok) {
     mkdirSync(join(dir, "rules"), { recursive: true });
     const copies = ruleCopies(rules.rules.map((rule) => rule.path));
     rules.rules.forEach((rule, index) => writeFileSync(join(dir, copies[index]), rule.text));
-    if (rules.decided !== null) writeFileSync(join(dir, DECIDED_COPY), rules.decided);
-    const prompt = buildPrompt({
-      diff,
-      base,
-      rules: rules.rules.map((rule) => rule.path),
-      decided: rules.decided !== null,
-      project: rules.project,
-    });
-    writeFileSync(join(dir, "prompt.md"), prompt);
-    run = runWorker(dir, prompt);
-  } else {
-    // No rules, no review: a reviewer without them would judge from memory.
-    run = { ok: false, error: rules.error, retried: false };
-  }
-
-  const verdictPath = join(dir, "verdict.json");
-  let parsed;
-  let workerNote;
-  if (!run.ok) {
-    parsed = { ok: false, error: run.error };
-    workerNote = `ERROR: ${run.error}`;
-  } else if (!existsSync(verdictPath)) {
-    // Never trust the worker's stdout; a run that wrote no file reviewed nothing.
-    parsed = { ok: false, error: `the worker exited 0 but wrote no verdict.json (${verdictPath})` };
-    workerNote = `ERROR: ${parsed.error}`;
-  } else {
-    try {
-      parsed = parseVerdict(readFileSync(verdictPath, "utf8"));
-    } catch (error) {
-      parsed = { ok: false, error: `verdict.json could not be read: ${error.message}` };
+    ruleFiles = copies.map((copy) => resolve(join(dir, copy)));
+    if (rules.decided !== null) {
+      decidedPath = resolve(join(dir, DECIDED_COPY));
+      writeFileSync(decidedPath, rules.decided);
     }
-    workerNote = run.retried ? "exited non-zero once; the retry succeeded" : "exit 0";
   }
 
-  const decision = decide({ parsed, blocking, truncated: diff.length > MAX_DIFF_CHARS });
+  let parsed;
+  if (!rules.ok) {
+    // No rules, no review: a reviewer without them would judge from memory.
+    parsed = { ok: false, error: rules.error };
+  } else if (coverage.length > 0) {
+    // Nothing may be silently dropped.
+    parsed = { ok: false, error: `diff coverage is incomplete: ${coverage.join("; ")}` };
+  } else {
+    const results = [];
+    for (const row of chunkRows) {
+      mkdirSync(row.dir, { recursive: true });
+      const chunkPatch = resolve(join(row.dir, "diff.patch"));
+      if (split.chunks.length > 1) writeFileSync(chunkPatch, row.chunk.text);
+      const verdictPath = resolve(join(row.dir, "verdict.json"));
+      const prompt = buildPrompt({
+        base,
+        rules: rules.rules.map((rule) => rule.path),
+        decided: rules.decided !== null,
+        project: rules.project,
+        chunk: row.chunk,
+        chunkIndex: row.index,
+        chunkCount: chunkRows.length,
+        diffPath: chunkPatch,
+        verdictPath,
+        rulePaths: ruleFiles,
+        decidedPath,
+        workdir: runWorkdir,
+      });
+      writeFileSync(join(row.dir, "prompt.md"), prompt);
+      const run = runWorker({
+        workdir: runWorkdir,
+        logDir: row.dir,
+        verdictPath,
+        prompt,
+      });
+      const verdict = readChunkVerdict(verdictPath, run);
+      row.parsed = verdict.parsed;
+      row.workerNote = verdict.workerNote;
+      results.push({ index: row.index, parsed: verdict.parsed });
+    }
+    parsed = mergeVerdicts(results);
+  }
+
+  const oversize = chunkRows.some((row) => row.oversize === true);
+  const decision = decide({ parsed, blocking, oversize });
   const verdictMd = join(dir, "verdict.md");
-  writeFileSync(verdictMd, renderVerdictMarkdown({ parsed, decision, base, diff, workerNote }));
+  writeFileSync(
+    verdictMd,
+    renderVerdictMarkdown({
+      parsed,
+      decision,
+      base,
+      diff,
+      chunkRows,
+      files: split.files,
+      runWorkdir,
+      coverage,
+    }),
+  );
   return { parsed, decision, dir, verdictMd };
 }
 
 /**
- * The human record of one review, next to the patch and the raw verdict.
- * @param {{ parsed: ReturnType<typeof parseVerdict>, decision: ReturnType<typeof decide>, base: string, diff: string, workerNote: string }} options
+ * The human record of one review, next to the patch and the raw verdict. It
+ * lists every chunk and every file the diff names, so coverage is auditable.
+ * @param {{ parsed: ReturnType<typeof parseVerdict>, decision: ReturnType<typeof decide>, base: string, diff: string, chunkRows: Array<object>, files: string[], runWorkdir: string, coverage: string[] }} options
  * @returns {string}
  */
-function renderVerdictMarkdown({ parsed, decision, base, diff, workerNote }) {
+function renderVerdictMarkdown({
+  parsed,
+  decision,
+  base,
+  diff,
+  chunkRows,
+  files,
+  runWorkdir,
+  coverage,
+}) {
   const lines = [
     `# ${decision.line}`,
     "",
     `- at: ${new Date().toISOString()}`,
     `- base: ${base}`,
-    `- diff: ${diff.length} characters${diff.length > MAX_DIFF_CHARS ? ` (diff.patch holds the first ${MAX_DIFF_CHARS})` : ""}`,
-    `- worker: ${workerNote}`,
+    `- diff: ${diff.length} characters`,
+    `- working directory: ${runWorkdir}`,
+    `- chunks: ${chunkRows.length}`,
+    `- files covered: ${files.length}`,
     "",
   ];
+  if (coverage.length > 0) {
+    lines.push("## Coverage problems", "");
+    for (const problem of coverage) lines.push(`- ${problem}`);
+    lines.push("");
+  }
+  lines.push("## Chunks", "");
+  if (chunkRows.length === 0) lines.push("None.");
+  for (const row of chunkRows) {
+    const verdict = row.parsed === null ? "not run" : row.parsed.ok === false ? "ERROR" : row.parsed.verdict;
+    const oversize = row.oversize ? " (one hunk exceeds the chunk limit)" : "";
+    lines.push(
+      `- chunk ${row.index}: ${verdict} — ${row.chars} characters, ${row.files.length} file(s)${oversize} — ${row.workerNote} — ${row.dir}`,
+    );
+  }
+  lines.push("", `## Files covered (${files.length})`, "");
+  if (files.length === 0) lines.push("None.");
+  const chunksByFile = new Map();
+  for (const row of chunkRows) {
+    for (const file of row.files) {
+      if (!chunksByFile.has(file)) chunksByFile.set(file, []);
+      chunksByFile.get(file).push(row.index);
+    }
+  }
+  for (const file of files)
+    lines.push(`- ${file} (chunk ${chunksByFile.get(file)?.join(", ") ?? "not covered"})`);
+  lines.push("");
   if (parsed.ok === false) {
     lines.push("## ERROR", "", parsed.error, "");
   } else {
@@ -606,6 +749,7 @@ function main(argv) {
     rules,
     outDir: join(top.root, ".diff-review"),
     blocking: blockingFromEnv(),
+    workdir: top.root,
   });
   report(result);
   return result.decision.exitCode;
