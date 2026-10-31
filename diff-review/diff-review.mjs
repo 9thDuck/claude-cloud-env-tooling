@@ -1238,10 +1238,6 @@ async function main(argv) {
       options.diffFile === null ? collectDiff(top.root, options.base) : readPatch(options.diffFile);
     if (!collected.ok) return setupError(collected.error);
     diff = collected.diff;
-    if (diff.trim().length === 0) {
-      console.log("diff-review: nothing to review");
-      return 0;
-    }
   }
   const result = await review({
     diff,

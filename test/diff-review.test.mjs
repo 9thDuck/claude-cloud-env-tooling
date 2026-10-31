@@ -236,6 +236,33 @@ describe("CLI", () => {
   });
 });
 
+// A --base that already contains HEAD (--base HEAD, or a branch ahead of HEAD)
+// makes the collected diff empty. In blocking mode that must not turn the gate
+// green with nothing reviewed: review() fails closed on zero chunks, so main()
+// must let the empty diff reach it.
+describe("CLI: an empty diff in blocking mode", () => {
+  it("is an ERROR with a verdict.md, not exit 0", () => {
+    const repo = makeRepo("empty-blocking-");
+    const result = spawnSync(
+      "node",
+      [resolve(import.meta.dirname, "..", "diff-review", "diff-review.mjs"), "--base", "HEAD"],
+      {
+        cwd: repo,
+        encoding: "utf8",
+        // The worker must never be called: there is no chunk to review.
+        env: { ...process.env, DIFF_REVIEW_BLOCKING: "1", DIFF_REVIEW_WORKER: "/nonexistent-worker" },
+      },
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).toContain("ERROR");
+    expect(result.stdout).toContain("nothing to review");
+    const runs = readdirSync(join(repo, ".diff-review")).filter((name) => name !== ".gitignore").sort();
+    expect(runs.length).toBe(1);
+    const verdict = readFileSync(join(repo, ".diff-review", runs[0], "verdict.md"), "utf8");
+    expect(verdict).toContain("ERROR");
+  });
+});
+
 // The CLI finds its tool files from its own path, so a copy of the tool with
 // its own XDG state is a complete installation. The state holds a fresh passing
 // self-test record, so the one file a test removes is the only fault --status
