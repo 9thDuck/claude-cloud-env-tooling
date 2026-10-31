@@ -584,7 +584,7 @@ export async function review({
       error:
         delta === null
           ? "nothing to review: the diff is empty and no verdict was produced"
-          : `nothing changed since the earlier verdict at ${head ?? delta.since}; reuse that verdict instead of a new one`,
+          : `nothing changed since the earlier verdict at ${delta.since}; reuse that verdict instead of a new one`,
     };
   } else {
     const concurrency = concurrencyFromEnv();

@@ -990,6 +990,26 @@ printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.
     expect(result.stderr).toContain("reuse that verdict instead of a new one");
   });
 
+  it("names the earlier verdict's head, not a new empty-commit HEAD, when the delta is empty", () => {
+    const repo = makeRepo("delta-cli-empty-");
+    writeFileSync(join(repo, "one.js"), "export const one = 1;\n");
+    execFileSync("git", ["add", "."], { cwd: repo });
+    execFileSync("git", ["commit", "-q", "-m", "one"], { cwd: repo });
+    const earlierHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
+    // An empty commit moves HEAD without changing the tree the verdict covers.
+    execFileSync("git", ["commit", "-q", "--allow-empty", "-m", "empty"], { cwd: repo });
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
+    expect(head).not.toBe(earlierHead);
+    const verdictDir = mkdtempSync(join(WORK, "delta-cli-verdict-"));
+    extraDirs.push(verdictDir);
+    const earlierPath = join(verdictDir, "earlier.md");
+    writeFileSync(earlierPath, earlierVerdict({ head: earlierHead, covered: ["one.js"] }));
+    const result = runCli(repo, earlierPath);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`nothing changed since the earlier verdict at ${earlierHead}`);
+    expect(result.stderr).not.toContain(head);
+  });
+
   it("carries a why-less earlier finding without inventing a reason", () => {
     const { repo, earlierHead } = deltaRepo("delta-cli-nowhy-");
     const verdictDir = mkdtempSync(join(WORK, "delta-cli-verdict-"));
