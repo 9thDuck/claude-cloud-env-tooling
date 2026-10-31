@@ -137,6 +137,23 @@ describe("buildPrompt", () => {
 });
 
 describe("splitFileSections", () => {
+  it("splits a plain diff -u patch with several files after each file's hunks", () => {
+    const diff = "--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-a\n+b\n--- a/y.txt\n+++ b/y.txt\n@@ -1,2 +1 @@\n-c\n-d\n+e\n";
+    expect(splitFileSections(diff).map((section) => section.path)).toEqual(["x.txt", "y.txt"]);
+    expect(filesInDiff(diff)).toEqual(["x.txt", "y.txt"]);
+  });
+
+  it("decodes git's octal-quoted non-ASCII paths", () => {
+    const quoted = '"a/caf\\303\\251.txt" "b/caf\\303\\251.txt"';
+    const diff = `diff --git ${quoted}\n--- "a/caf\\303\\251.txt"\n+++ "b/caf\\303\\251.txt"\n@@ -1 +1 @@\n-a\n+b\n`;
+    expect(filesInDiff(diff)).toEqual(["café.txt"]);
+    expect(splitFileSections(diff).map((section) => section.path)).toEqual(["café.txt"]);
+  });
+
+  it("reports a quoted path it cannot decode instead of guessing", () => {
+    expect(() => filesInDiff('diff --git "a/x\\q" "b/x\\q"\n')).toThrow(/cannot unquote git path/);
+  });
+
   it("keeps every byte and names each file", () => {
     const diff = `${fileSection("src/a.js")}\n${fileSection("docs/b.md")}\n`;
     const sections = splitFileSections(diff);

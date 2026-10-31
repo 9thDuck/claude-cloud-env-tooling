@@ -57,20 +57,49 @@ export function fileRank(path) {
   return 1;
 }
 
+const C_ESCAPES = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+
+/**
+ * Decode git's C-style quoted path (core.quotePath): `\ooo` octal bytes and
+ * the escapes in C_ESCAPES, read as UTF-8.
+ * @param {string} quoted the path with its surrounding quotes.
+ * @returns {string}
+ * @throws {Error} on an escape git does not write or bytes that are not UTF-8.
+ */
+function unquoteC(quoted) {
+  const bytes = [];
+  const body = quoted.slice(1, -1);
+  for (let index = 0; index < body.length; index += 1) {
+    const char = body[index];
+    if (char !== "\\") {
+      bytes.push(...new TextEncoder().encode(char));
+      continue;
+    }
+    const octal = /^[0-7]{3}/.exec(body.slice(index + 1));
+    if (octal !== null) {
+      bytes.push(Number.parseInt(octal[0], 8));
+      index += 3;
+      continue;
+    }
+    const code = C_ESCAPES[body[index + 1]];
+    if (code === undefined) throw new Error(`diff-review: cannot unquote git path ${quoted}`);
+    bytes.push(code);
+    index += 1;
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(bytes));
+  } catch {
+    throw new Error(`diff-review: git path ${quoted} is not UTF-8`);
+  }
+}
+
 /**
  * A git path from a header, removing the a/ or b/ prefix and quotes.
- * @param {string} value e.g. `b/src/a.js` or `"a/file with space.js"`.
+ * @param {string} value e.g. `b/src/a.js` or `"b/caf\\303\\251.js"`.
  * @returns {string}
  */
 function unquotePath(value) {
-  let path = value;
-  if (path.startsWith('"') && path.endsWith('"')) {
-    try {
-      path = JSON.parse(path);
-    } catch {
-      path = path.slice(1, -1);
-    }
-  }
+  const path = value.startsWith('"') && value.endsWith('"') ? unquoteC(value) : value;
   return path.replace(/^[ab]\//, "");
 }
 
@@ -114,8 +143,9 @@ function sectionPath(text) {
 /**
  * Split a unified diff into per-file sections, preserving every byte.
  * Sections start at `diff --git`; a plain `diff -u` header without it is also
- * recognised. Hunks are tracked so a removed line that looks like a header is
- * never mistaken for one.
+ * recognised. Hunk line counts are tracked, so a removed line that looks like a
+ * header is never mistaken for one and the next file's header is found after
+ * the last hunk.
  * @param {string} diff
  * @returns {Array<{ path: string | null, text: string }>}
  */
@@ -124,11 +154,13 @@ export function splitFileSections(diff) {
   const lines = diff.split("\n");
   const sections = [];
   let current = null;
-  let inHunk = false;
+  let oldLeft = 0;
+  let newLeft = 0;
   const start = (line) => {
     current = { lines: line === null ? [] : [line] };
     sections.push(current);
-    inHunk = false;
+    oldLeft = 0;
+    newLeft = 0;
   };
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
@@ -136,6 +168,7 @@ export function splitFileSections(diff) {
       start(line);
       continue;
     }
+    const inHunk = oldLeft > 0 || newLeft > 0;
     if (!inHunk && line.startsWith("--- ") && /^\+\+\+ /.test(lines[index + 1] ?? "")) {
       const ownHeader = current !== null && current.lines.some((entry) => entry.startsWith("+++ "));
       if (current === null || ownHeader) {
@@ -145,7 +178,17 @@ export function splitFileSections(diff) {
     }
     if (current === null) start(null);
     current.lines.push(line);
-    if (line.startsWith("@@ ")) inHunk = true;
+    const hunk = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(line);
+    if (!inHunk && hunk !== null) {
+      oldLeft = Number(hunk[1] ?? 1);
+      newLeft = Number(hunk[2] ?? 1);
+    } else if (inHunk) {
+      if (line.startsWith(" ") || line === "") {
+        oldLeft -= 1;
+        newLeft -= 1;
+      } else if (line.startsWith("-")) oldLeft -= 1;
+      else if (line.startsWith("+")) newLeft -= 1;
+    }
   }
   return sections.map((section) => {
     const text = section.lines.join("\n");
