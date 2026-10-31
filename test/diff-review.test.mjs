@@ -289,6 +289,25 @@ describe("review: repo read access and chunking", () => {
     expect(markdown).not.toContain("not covered");
   });
 
+  it("is an ERROR when a hunk is larger than the chunk limit (F2)", async () => {
+    const repo = makeRepo("oversize-");
+    const added = Array.from({ length: 40 }, (_, index) => `+const value${index} = ${index};`).join("\n");
+    const diff = `${fileSection("src/feature.js", [`@@ -0,0 +1,40 @@\n${added}`])}\n`;
+    const result = await review({
+      diff,
+      base: "main",
+      rules: defaultRules(),
+      outDir: join(repo, ".diff-review"),
+      blocking: true,
+      workdir: repo,
+      maxChars: 150,
+    });
+    // The worker says PASS, but its single chunk was too big to have been read whole.
+    expect(result.parsed).toMatchObject({ ok: true, verdict: "PASS" });
+    expect(result.decision.exitCode).toBe(1);
+    expect(result.decision.line).toContain("ERROR");
+  });
+
   it("gives each worker run a timeout scaled to its chunk size", async () => {
     const repo = makeRepo("timeout-");
     const workerDir = mkdtempSync(join(WORK, "recording-worker-"));
@@ -348,6 +367,20 @@ describe("review: repo read access and chunking", () => {
     expect(result.stdout).toContain("diff-review: FAIL (advisory) 1 finding");
     expect(result.stdout).toContain("verdict:");
   });
+
+  it("is a setup ERROR naming the git failure when the repository has no HEAD", () => {
+    const repo = mkdtempSync(join(WORK, "no-head-"));
+    extraDirs.push(repo);
+    execFileSync("git", ["init", "-q", "-b", "main"], { cwd: repo });
+    const result = spawnSync(
+      "node",
+      [resolve(import.meta.dirname, "..", "diff-review", "diff-review.mjs"), "--base", "main"],
+      { cwd: repo, encoding: "utf8" },
+    );
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("git rev-parse HEAD exited");
+    expect(result.stderr).toContain("ERROR report");
+  });
 });
 
 // eco-worker exits 4 when any optional Bash call was refused, even after the
@@ -361,6 +394,28 @@ printf '# Refused tool calls in run old\\n- NOT ALLOWED Bash: old-command\\n' > 
 touch -d '2000-01-01' "$out/old.blocked.md"
 printf '# Refused tool calls in run new\\nRules line.\\n- NOT ALLOWED Bash: git log --all\\n- DENIED Bash: gh pr view\\n' > "$out/new.blocked.md"
 touch -d '2020-01-01' "$out/new.blocked.md"
+exit 4
+`;
+
+// A blocked leg whose newest *.blocked.md is a directory: reading it fails, and
+// the review must say so rather than printing "None.".
+const BLOCKED_UNREADABLE_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf 'x\\n' >> "$out/attempts"
+printf '%s\\n' '{"verdict":"FAIL","findings":[{"file":"src/bad.js","line":1,"rule":"No stubs","why":"planted bad file"}],"untested":[]}' > "$out/verdict.json"
+mkdir "$out/run-x.blocked.md"
+touch -d '2030-01-01' "$out/run-x.blocked.md"
+exit 4
+`;
+
+// A blocked leg whose newest *.blocked.md is readable but has no "- " line: the
+// review must say it lists no refused call rather than printing "None.".
+const BLOCKED_EMPTY_FILE_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf 'x\\n' >> "$out/attempts"
+printf '%s\\n' '{"verdict":"FAIL","findings":[{"file":"src/bad.js","line":1,"rule":"No stubs","why":"planted bad file"}],"untested":[]}' > "$out/verdict.json"
+printf '# Refused tool calls in run x\\nRules line.\\n' > "$out/run-x.blocked.md"
+touch -d '2030-01-01' "$out/run-x.blocked.md"
 exit 4
 `;
 
@@ -432,6 +487,26 @@ describe("review: a blocked worker (exit 4)", () => {
     expect(markdown).not.toContain("old-command");
   });
 
+  it("reports an unreadable blocked.md instead of listing no refused calls", async () => {
+    const result = await runReview(script("blocked-unreadable.sh", BLOCKED_UNREADABLE_WORKER));
+    expect(result.parsed).toMatchObject({ ok: true, verdict: "FAIL" });
+    expect(attempts(result)).toBe(1);
+    const markdown = readFileSync(result.verdictMd, "utf8");
+    const section = markdown.slice(markdown.indexOf("## Untested / refused calls"));
+    expect(section).not.toContain("None.");
+    expect(section).toContain("could not read");
+  });
+
+  it("reports a blocked.md with no refused-call line instead of listing none", async () => {
+    const result = await runReview(script("blocked-empty-file.sh", BLOCKED_EMPTY_FILE_WORKER));
+    expect(result.parsed).toMatchObject({ ok: true, verdict: "FAIL" });
+    expect(attempts(result)).toBe(1);
+    const markdown = readFileSync(result.verdictMd, "utf8");
+    const section = markdown.slice(markdown.indexOf("## Untested / refused calls"));
+    expect(section).not.toContain("None.");
+    expect(section).toContain("lists no refused call");
+  });
+
   it("is an ERROR when exit 4 leaves no verdict, after retrying", async () => {
     const result = await runReview(script("blocked-empty.sh", BLOCKED_NO_VERDICT_WORKER));
     expect(result.parsed.ok).toBe(false);
@@ -445,6 +520,76 @@ describe("review: a blocked worker (exit 4)", () => {
     expect(result.parsed.ok).toBe(false);
     expect(result.parsed.error).toContain("exited 1 twice");
     expect(attempts(result)).toBe(2);
+  });
+});
+
+// An unreadable log must not read as "no rejection": the chunk is an ERROR that
+// names the path and the error, instead of a retried generic failure.
+const UNREADABLE_LOG_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf 'x\\n' >> "$out/attempts"
+mkdir "$out/run.log"
+exit 1
+`;
+
+const MISSING_LOG_DIR_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf 'x\\n' >> "$out/attempts"
+rm -rf "$out"
+exit 1
+`;
+
+describe("review: unreadable worker logs", () => {
+  let scriptsDir;
+  let previousWorker;
+
+  function script(name, body) {
+    const path = join(scriptsDir, name);
+    writeFileSync(path, body);
+    chmodSync(path, 0o755);
+    return path;
+  }
+
+  async function runReview(worker, { diff = `${fileSection("src/bad.js")}\n`, maxChars } = {}) {
+    process.env.DIFF_REVIEW_WORKER = worker;
+    const repo = makeRepo("unreadable-log-");
+    return await review({
+      diff,
+      base: "main",
+      rules: defaultRules(),
+      outDir: join(repo, ".diff-review"),
+      blocking: false,
+      workdir: repo,
+      ...(maxChars === undefined ? {} : { maxChars }),
+    });
+  }
+
+  beforeAll(() => {
+    scriptsDir = mkdtempSync(join(WORK, "unreadable-log-workers-"));
+    extraDirs.push(scriptsDir);
+    previousWorker = process.env.DIFF_REVIEW_WORKER;
+  });
+
+  afterAll(() => {
+    if (previousWorker === undefined) delete process.env.DIFF_REVIEW_WORKER;
+    else process.env.DIFF_REVIEW_WORKER = previousWorker;
+  });
+
+  it("is an ERROR naming a log file that cannot be read", async () => {
+    const result = await runReview(script("dir-log.sh", UNREADABLE_LOG_WORKER));
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toContain("run.log");
+    expect(result.parsed.error).toContain("EISDIR");
+  });
+
+  it("is an ERROR naming a log directory that cannot be listed", async () => {
+    // Two chunks, so the worker's log dir is a chunk dir and not the run dir
+    // that review still needs for verdict.md.
+    const diff = ["src/aaa.js", "src/zzz.js"].map((path) => fileSection(path)).join("\n");
+    const result = await runReview(script("no-dir.sh", MISSING_LOG_DIR_WORKER), { diff, maxChars: 150 });
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toContain("could not read the worker logs in");
+    expect(result.parsed.error).toContain("ENOENT");
   });
 });
 
@@ -704,7 +849,10 @@ function earlierVerdict({ head, result = "PASS", covered = [], findings = [] }) 
     "",
     ...(findings.length === 0
       ? ["None."]
-      : findings.map((finding) => `- \`${finding.file}:${finding.line ?? "-"}\` ${finding.rule} — ${finding.why}`)),
+      : findings.map(
+          (finding) =>
+            `- \`${finding.file}:${finding.line ?? "-"}\` ${finding.rule}${finding.why === undefined ? "" : ` — ${finding.why}`}`,
+        )),
     "",
   ].join("\n");
 }
@@ -888,5 +1036,64 @@ printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.
     const result = runCli(repo, earlierPath);
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("ERROR verdict");
+  });
+
+  it("is an ERROR at an unchanged head instead of a PASS over zero chunks", () => {
+    // Everything committed: the tree at HEAD is exactly the tree the verdict covers.
+    const repo = makeRepo("delta-cli-same-");
+    writeFileSync(join(repo, "one.js"), "export const one = 1;\n");
+    execFileSync("git", ["add", "."], { cwd: repo });
+    execFileSync("git", ["commit", "-q", "-m", "one"], { cwd: repo });
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
+    const verdictDir = mkdtempSync(join(WORK, "delta-cli-verdict-"));
+    extraDirs.push(verdictDir);
+    const earlierPath = join(verdictDir, "earlier.md");
+    writeFileSync(earlierPath, earlierVerdict({ head, covered: ["one.js"] }));
+    const result = runCli(repo, earlierPath);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`nothing changed since the earlier verdict at ${head}`);
+    expect(result.stderr).toContain("reuse that verdict instead of a new one");
+  });
+
+  it("names the earlier verdict's head, not a new empty-commit HEAD, when the delta is empty", () => {
+    const repo = makeRepo("delta-cli-empty-");
+    writeFileSync(join(repo, "one.js"), "export const one = 1;\n");
+    execFileSync("git", ["add", "."], { cwd: repo });
+    execFileSync("git", ["commit", "-q", "-m", "one"], { cwd: repo });
+    const earlierHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
+    // An empty commit moves HEAD without changing the tree the verdict covers.
+    execFileSync("git", ["commit", "-q", "--allow-empty", "-m", "empty"], { cwd: repo });
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
+    expect(head).not.toBe(earlierHead);
+    const verdictDir = mkdtempSync(join(WORK, "delta-cli-verdict-"));
+    extraDirs.push(verdictDir);
+    const earlierPath = join(verdictDir, "earlier.md");
+    writeFileSync(earlierPath, earlierVerdict({ head: earlierHead, covered: ["one.js"] }));
+    const result = runCli(repo, earlierPath);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`nothing changed since the earlier verdict at ${earlierHead}`);
+    expect(result.stderr).not.toContain(head);
+  });
+
+  it("carries a why-less earlier finding without inventing a reason", () => {
+    const { repo, earlierHead } = deltaRepo("delta-cli-nowhy-");
+    const verdictDir = mkdtempSync(join(WORK, "delta-cli-verdict-"));
+    extraDirs.push(verdictDir);
+    const earlierPath = join(verdictDir, "earlier.md");
+    writeFileSync(
+      earlierPath,
+      earlierVerdict({
+        head: earlierHead,
+        result: "FAIL",
+        covered: ["one.js", "old.js"],
+        findings: [{ file: "old.js", line: 4, rule: "No stubs" }],
+      }),
+    );
+    const result = runCli(repo, earlierPath);
+    expect(result.status).toBe(0);
+    const markdown = readFileSync(latestVerdict(repo), "utf8");
+    expect(markdown).toContain("- `old.js:4` No stubs\n");
+    expect(markdown).not.toContain("carried from the earlier verdict");
+    expect(markdown).not.toContain("No stubs — ");
   });
 });
