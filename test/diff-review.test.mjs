@@ -32,6 +32,7 @@ import {
   stateDir,
   workerCommand,
 } from "../diff-review/diff-review.mjs";
+import { commandAllowed } from "./bash-rule-matches.mjs";
 
 const WORK = resolve(import.meta.dirname, "..", ".work");
 let dir;
@@ -66,19 +67,6 @@ function fileSection(path, hunks = ["@@ -1 +1 @@\n-a\n+b"]) {
   ].join("\n");
 }
 
-// Claude Code Bash rules: `Bash(p:*)` matches p or a command starting with "p ",
-// `Bash(p)` only p; a deny match refuses, else an allow match allows.
-function bashRuleMatches(rule, command) {
-  const body = /^Bash\((.+)\)$/.exec(rule)?.[1];
-  if (body === undefined) return false;
-  const prefix = body.endsWith(":*") ? body.slice(0, -2) : null;
-  return prefix === null ? command === body : command === prefix || command.startsWith(`${prefix} `);
-}
-
-const commandAllowed = (permissions, command) =>
-  !permissions.permissions.deny.some((rule) => bashRuleMatches(rule, command)) &&
-  permissions.permissions.allow.some((rule) => bashRuleMatches(rule, command));
-
 // Proves what the worker may read: it reads app.js, a repo file outside the
 // diff, from the root its -a "Read(/<root>/**)" rule grants, and writes its
 // verdict to its chunk directory. Without the rule it has no repo to read.
@@ -96,6 +84,7 @@ prompt="$last"
 [ -n "$root" ] || { echo "no read rule" >&2; exit 1; }
 value="$(cat "$root/app.js")"
 printf 'cwd=%s\\nread app.js=%s\\n' "$PWD" "$value" > "$out/c1-read-proof.txt"
+printf '%s\\n' "\${GIT_PAGER:-}" > "$out/git-pager.txt"
 if printf '%s' "$prompt" | grep -q 'src/bad.js'; then
   printf '%s\\n' '{"verdict":"FAIL","findings":[{"file":"src/bad.js","line":1,"rule":"No stubs","why":"planted bad file"}],"untested":[]}' > "$out/verdict.json"
 else
@@ -557,6 +546,26 @@ describe("review: repo read access and chunking", () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("diff-review: FAIL (advisory) 1 finding");
     expect(result.stdout).toContain("verdict:");
+  });
+
+  it("gives the reviewer GIT_PAGER=cat so git never opens a pager", () => {
+    const repo = makeRepo("git-pager-");
+    execFileSync("git", ["branch", "origin/main", "main"], { cwd: repo });
+    writeFileSync(join(repo, "change.patch"), `${fileSection("src/feature.js")}\n`);
+    const env = { ...process.env, DIFF_REVIEW_WORKER: fakeWorker };
+    // Prove the value comes from runWorker, not from this test's environment.
+    delete env.GIT_PAGER;
+    const result = spawnSync(
+      "node",
+      [resolve(import.meta.dirname, "..", "diff-review", "diff-review.mjs"), "--diff-file", "change.patch"],
+      { cwd: repo, encoding: "utf8", env },
+    );
+    expect(result.status).toBe(0);
+    const run = readdirSync(join(repo, ".diff-review"), { withFileTypes: true }).find((entry) =>
+      entry.isDirectory(),
+    );
+    const pager = readFileSync(join(repo, ".diff-review", run.name, "chunks", "1", "git-pager.txt"), "utf8");
+    expect(pager.trim()).toBe("cat");
   });
 
   it("is a setup ERROR naming the git failure when the repository has no HEAD", () => {
