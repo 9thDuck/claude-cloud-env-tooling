@@ -238,8 +238,9 @@ function readVerdictFile(verdictPath) {
 /**
  * The refused-call lines from the newest *.blocked.md a worker leg left in
  * `logDir`. eco-worker writes one blocked.md per leg and lists each refused
- * command there; the newline-delimited "- " lines are the commands. Empty when
- * the run wrote none.
+ * command there; the newline-delimited "- " lines are the commands. Empty only
+ * when the directory was read and holds no *.blocked.md file; a directory or
+ * file that cannot be read yields one line saying so, never an empty list.
  * @param {string} logDir
  * @returns {string[]}
  */
@@ -249,11 +250,11 @@ function refusedCalls(logDir) {
     const files = readdirSync(logDir)
       .filter((name) => name.endsWith(".blocked.md"))
       .map((name) => ({ name, mtime: statSync(join(logDir, name)).mtimeMs }))
-      // Newest first; the run id breaks an mtime tie, later legs sort later.
+      // Newest first; on an mtime tie the later run id (a later leg) sorts first.
       .sort((left, right) => right.mtime - left.mtime || (left.name < right.name ? 1 : -1));
     newest = files[0]?.name;
-  } catch {
-    return [];
+  } catch (error) {
+    return [`could not read the refused calls in ${logDir}: ${error.message}`];
   }
   if (newest === undefined) return [];
   try {
@@ -262,8 +263,8 @@ function refusedCalls(logDir) {
       .filter((line) => line.startsWith("- "))
       .map((line) => line.slice(2).trim())
       .filter((line) => line.length > 0);
-  } catch {
-    return [];
+  } catch (error) {
+    return [`could not read the refused calls in ${join(logDir, newest)}: ${error.message}`];
   }
 }
 
