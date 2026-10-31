@@ -66,6 +66,19 @@ function fileSection(path, hunks = ["@@ -1 +1 @@\n-a\n+b"]) {
   ].join("\n");
 }
 
+// Claude Code Bash rules: `Bash(p:*)` matches p or a command starting with "p ",
+// `Bash(p)` only p; a deny match refuses, else an allow match allows.
+function bashRuleMatches(rule, command) {
+  const body = /^Bash\((.+)\)$/.exec(rule)?.[1];
+  if (body === undefined) return false;
+  const prefix = body.endsWith(":*") ? body.slice(0, -2) : null;
+  return prefix === null ? command === body : command === prefix || command.startsWith(`${prefix} `);
+}
+
+const commandAllowed = (permissions, command) =>
+  !permissions.permissions.deny.some((rule) => bashRuleMatches(rule, command)) &&
+  permissions.permissions.allow.some((rule) => bashRuleMatches(rule, command));
+
 // Proves what the worker may read: it reads app.js, a repo file outside the
 // diff, from the root its -a "Read(/<root>/**)" rule grants, and writes its
 // verdict to its chunk directory. Without the rule it has no repo to read.
@@ -633,6 +646,15 @@ printf 'tampered\\n' >> "$root/app.js"
 printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
 `;
 
+// Records the permissions file and the -a rule's root, then passes untouched.
+const PERMISSIONS_READER_WORKER = `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf '%s\\n' "\${ECO_WORKER_PERMISSIONS:-}" > "$out/permissions-path.txt"
+for arg in "$@"; do [ "$prev" != "-a" ] || root="\${arg#Read(/}"; prev="$arg"; done
+printf '%s\\n' "\${root%/\\*\\*)}" > "$out/root.txt"
+printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
+`;
+
 const EXIT_ONE_WORKER = `#!/usr/bin/env bash
 out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
 printf 'x\\n' >> "$out/attempts"
@@ -746,7 +768,10 @@ describe("review: a blocked worker (exit 4)", () => {
 
   it("is an ERROR when the worker changes the repository, and runs it under the reviewer permissions", async () => {
     const result = await runReview(script("repo-writer.sh", REPO_WRITER_WORKER));
-    expect(readFileSync(join(result.dir, "chunks", "1", "permissions.txt"), "utf8").trim()).toBe(REVIEWER_PERMISSIONS);
+    const chunkDir = join(result.dir, "chunks", "1");
+    expect(readFileSync(join(chunkDir, "permissions.txt"), "utf8").trim()).toBe(
+      join(chunkDir, "reviewer-permissions.json"),
+    );
     expect(result.parsed.ok).toBe(false);
     expect(result.parsed.error).toContain("the reviewer changed the repository");
     expect(JSON.parse(readFileSync(join(result.dir, "verdict.json"), "utf8")).verdict).toBe("ERROR");
@@ -777,6 +802,38 @@ describe("review: a blocked worker (exit 4)", () => {
     expect(result.parsed.ok).toBe(false);
     expect(result.parsed.error).toContain("exited 1 twice");
     expect(attempts(result)).toBe(2);
+  });
+});
+
+describe("reviewer git -C rules", () => {
+  it("allows read-only git -C on the repository under review and refuses every other -C", async () => {
+    const previousWorker = process.env.DIFF_REVIEW_WORKER;
+    const scriptsDir = mkdtempSync(join(WORK, "git-c-workers-"));
+    extraDirs.push(scriptsDir);
+    process.env.DIFF_REVIEW_WORKER = join(scriptsDir, "permissions-reader.sh");
+    writeFileSync(process.env.DIFF_REVIEW_WORKER, PERMISSIONS_READER_WORKER);
+    chmodSync(process.env.DIFF_REVIEW_WORKER, 0o755);
+    try {
+      const repo = makeRepo("git-c-");
+      const result = await review({
+        diff: `${fileSection("src/bad.js")}\n`,
+        base: "main",
+        rules: defaultRules(),
+        outDir: join(repo, ".diff-review"),
+        readRoot: repo,
+      });
+      const read = (name) => readFileSync(join(result.dir, "chunks", "1", name), "utf8").trim();
+      const permissions = JSON.parse(readFileSync(read("permissions-path.txt"), "utf8"));
+      const root = read("root.txt");
+      expect(commandAllowed(permissions, `git -C ${root} log --oneline -1 -- app.js`)).toBe(true);
+      expect(commandAllowed(permissions, "git -C /some/other/path log --oneline -1")).toBe(false);
+      expect(commandAllowed(permissions, `git -C ${root} push origin HEAD`)).toBe(false);
+      expect(commandAllowed(permissions, `git -C ${root}-evil log --oneline -1`)).toBe(false);
+      expect(commandAllowed(permissions, `git -C ${root}/../x log --oneline -1`)).toBe(false);
+    } finally {
+      if (previousWorker === undefined) delete process.env.DIFF_REVIEW_WORKER;
+      else process.env.DIFF_REVIEW_WORKER = previousWorker;
+    }
   });
 });
 

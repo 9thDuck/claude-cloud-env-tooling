@@ -814,6 +814,35 @@ export function allowedBashCommands(permissions) {
   });
 }
 
+/**
+ * The reviewer's permissions for one run: a `-C <root>` twin of every
+ * `Bash(git ...)` allow rule, so the reviewer (whose cwd is its chunk's run
+ * directory, not the repo root) can run read-only git against the repository
+ * under review. Only that root and only allow-listed subcommands get a twin,
+ * so any other -C path or a write subcommand is refused. Deny rules are
+ * copied; the input is not mutated.
+ * @param {{ permissions: { allow: unknown[], deny: unknown[] } }} permissions parsed permissions JSON.
+ * @param {string} root the repository root under review.
+ * @returns {Record<string, any>} a new permissions object.
+ * @throws {Error} when `permissions.permissions.allow` or `.deny` is not an array.
+ */
+export function reviewerPermissionsFor(permissions, root) {
+  const source = permissions.permissions;
+  if (!Array.isArray(source.allow)) {
+    throw new Error("reviewer permissions have no permissions.allow list");
+  }
+  if (!Array.isArray(source.deny)) {
+    throw new Error("reviewer permissions have no permissions.deny list");
+  }
+  const twins = source.allow.flatMap((rule) =>
+    typeof rule === "string" && rule.startsWith("Bash(git ")
+      ? [`Bash(git -C ${root} ${rule.slice("Bash(git ".length)}`]
+      : [],
+  );
+  const merged = { ...source, allow: [...source.allow, ...twins], deny: [...source.deny] };
+  return { ...permissions, permissions: merged };
+}
+
 /** Where the reviewer finds its copy of the decided-items file. */
 export const DECIDED_COPY = "./decided.md";
 
@@ -871,7 +900,7 @@ export function buildPrompt({
     "",
     readRoot === null
       ? `Your working directory is ${workdir}. There is no repository to read for this review; judge the diff and the rule files. The only files you may write are ${verdictPath} and the progress file named in your WORKER RULES.`
-      : `Your working directory is ${workdir}, this chunk's directory. The repository is at ${readRoot}: read it with Read, Grep and Glob on absolute paths under ${readRoot}, and with plain git show/log/diff/blame/rev-parse/ls-files run from your working directory, which is inside the repository (git -C is refused); that is where you verify what the diff claims. Do not change the repository: the run compares its state before and after you, and any change makes the review an ERROR. The only files you may write are ${verdictPath} and the progress file named in your WORKER RULES.`,
+      : `Your working directory is ${workdir}, this chunk's directory. The repository is at ${readRoot}: read it with Read, Grep and Glob on absolute paths under ${readRoot}, and with plain git show/log/diff/blame/rev-parse/ls-files run from your working directory, which is inside the repository; read-only git also works as \`git -C ${readRoot} <subcommand>\` for the allowed subcommands, and any other git -C path is refused; that is where you verify what the diff claims. Do not change the repository: the run compares its state before and after you, and any change makes the review an ERROR. The only files you may write are ${verdictPath} and the progress file named in your WORKER RULES.`,
     ...(allowedCommands.length > 0
       ? [
           `Bash is limited to these commands: ${allowedCommands.join(", ")}. Do not run tests, builds, node or any other command: a refused call makes the whole review an ERROR. List what you could not check that way under \`untested\` instead.`,

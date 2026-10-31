@@ -21,6 +21,7 @@ import {
   parseEarlierVerdict,
   parseVerdict,
   rateLimitDetail,
+  reviewerPermissionsFor,
   ruleCopies,
   runPool,
   runsToPrune,
@@ -123,6 +124,30 @@ describe("allowedBashCommands", () => {
   });
 });
 
+describe("reviewerPermissionsFor", () => {
+  it("throws when permissions.allow is missing", () => {
+    expect(() => reviewerPermissionsFor({ permissions: { deny: [] } }, "/repo")).toThrow(
+      /permissions\.allow/,
+    );
+  });
+
+  it("throws when permissions.deny is missing", () => {
+    expect(() => reviewerPermissionsFor({ permissions: { allow: [] } }, "/repo")).toThrow(
+      /permissions\.deny/,
+    );
+  });
+
+  it("adds git -C twins without mutating its input", () => {
+    const input = {
+      permissions: { allow: ["Bash(git show:*)", "Bash(ls)"], deny: ["Bash(push:*)"] },
+    };
+    const result = reviewerPermissionsFor(input, "/repo");
+    expect(result.permissions.allow).toContain("Bash(git -C /repo show:*)");
+    expect(input.permissions.allow).toEqual(["Bash(git show:*)", "Bash(ls)"]);
+    expect(input.permissions.deny).toEqual(["Bash(push:*)"]);
+  });
+});
+
 describe("buildPrompt", () => {
   it("names the allowed commands and says a refused call is an ERROR", () => {
     const prompt = buildPrompt({ base: "main", allowedCommands: ["git show", "grep"] });
@@ -157,7 +182,8 @@ describe("buildPrompt", () => {
     expect(prompt).toContain("Your working directory is /runs/1/chunks/2, this chunk's directory");
     expect(prompt).toContain("any change makes the review an ERROR");
     expect(prompt).not.toContain("Bash is limited to");
-    expect(prompt).toContain("git -C is refused");
+    expect(prompt).toContain("git -C /repo");
+    expect(prompt).toContain("any other git -C path is refused");
     expect(prompt).toContain("- src/a.js");
     expect(prompt).toContain("- e2e/a.js");
     expect(prompt).not.toContain("decided");
