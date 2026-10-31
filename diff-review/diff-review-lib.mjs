@@ -180,6 +180,7 @@ export function splitFileSections(diff) {
     current.lines.push(line);
     const hunk = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(line);
     if (!inHunk && hunk !== null) {
+      // Unified diff omits ",count" when the count is 1, so an absent group means 1.
       oldLeft = Number(hunk[1] ?? 1);
       newLeft = Number(hunk[2] ?? 1);
     } else if (inHunk) {
