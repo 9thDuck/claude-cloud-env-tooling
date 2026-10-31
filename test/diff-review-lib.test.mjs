@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   DIFF_REVIEW_CHUNK_CHARS,
+  allowedBashCommands,
   blockingFromEnv,
   buildPrompt,
   concurrencyFromEnv,
@@ -110,7 +111,24 @@ describe("blockingFromEnv", () => {
   });
 });
 
+describe("allowedBashCommands", () => {
+  it("lists the Bash commands of the allow list, with or without :*", () => {
+    expect(
+      allowedBashCommands({
+        permissions: { allow: ["Read(/x/**)", "Bash(git show:*)", "Bash(ls)", 3], deny: ["Bash(rm:*)"] },
+      }),
+    ).toEqual(["git show", "ls"]);
+    expect(allowedBashCommands({})).toEqual([]);
+  });
+});
+
 describe("buildPrompt", () => {
+  it("names the allowed commands and says a refused call is an ERROR", () => {
+    const prompt = buildPrompt({ base: "main", allowedCommands: ["git show", "grep"] });
+    expect(prompt).toContain("Bash is limited to these commands: git show, grep.");
+    expect(prompt).toContain("a refused call makes the whole review an ERROR");
+  });
+
   it("names absolute rule paths, the project, the files and the chunk", () => {
     const prompt = buildPrompt({
       base: "origin/main",
@@ -133,6 +151,7 @@ describe("buildPrompt", () => {
     expect(prompt).toContain("Your working directory is /runs/1/chunks/2");
     expect(prompt).toContain("The repository is at /repo");
     expect(prompt).toContain("plain git show");
+    expect(prompt).not.toContain("Bash is limited to");
     expect(prompt).toContain("git -C is refused");
     expect(prompt).toContain("- src/a.js");
     expect(prompt).toContain("- e2e/a.js");
@@ -644,6 +663,15 @@ describe("rateLimitDetail", () => {
     expect(rateLimitDetail('{"type":"result","is_error":false,"result":"ok"}')).toBeNull();
     expect(rateLimitDetail("")).toBeNull();
   });
+
+  it("ignores 429 text inside tool output and model text (planted: a reviewer reading this file)", () => {
+    const log = [
+      '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"/\\"rate_limit_error\\"/ and \\"error_status\\":429"}]}}',
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"api_error_status=429 is matched"}]}}',
+    ].join("\n");
+    expect(rateLimitDetail(log)).toBeNull();
+    expect(rateLimitDetail(`${log}\n{"type":"result","api_error_status":429,"result":"quota gone"}`)).toBe("quota gone");
+  });
 });
 
 describe("turnCapDetail", () => {
@@ -657,5 +685,6 @@ describe("turnCapDetail", () => {
   it("does not treat max_turns alone or a normal result as a cap hit", () => {
     expect(turnCapDetail("max_turns=40 turns=3")).toBeNull();
     expect(turnCapDetail('{"type":"result","is_error":false,"result":"ok"}')).toBeNull();
+    expect(turnCapDetail('{"type":"user","message":{"content":"error_max_turns and the turn cap"}}')).toBeNull();
   });
 });

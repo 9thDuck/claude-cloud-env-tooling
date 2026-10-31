@@ -24,6 +24,7 @@ import {
   parseArgs,
   prepareDelta,
   REVIEWER_PERMISSIONS,
+  repoState,
   review,
   stateDir,
   workerCommand,
@@ -507,6 +508,26 @@ describe("review: a blocked worker (exit 4)", () => {
     expect(JSON.parse(readFileSync(join(result.dir, "verdict.json"), "utf8")).verdict).toBe("ERROR");
   });
 
+  it("is an ERROR, with no worker run, when the repository state cannot be recorded first", async () => {
+    process.env.DIFF_REVIEW_WORKER = script("never.sh", REPO_WRITER_WORKER);
+    // WORK sits inside this repo, so a broken .git link is what makes git fail here.
+    const notRepo = mkdtempSync(join(WORK, "not-repo-"));
+    extraDirs.push(notRepo);
+    writeFileSync(join(notRepo, ".git"), "gitdir: ./missing\n");
+    const result = await review({
+      diff: `${fileSection("src/bad.js")}\n`,
+      base: "main",
+      rules: defaultRules(),
+      outDir: join(notRepo, ".diff-review"),
+      blocking: false,
+      readRoot: notRepo,
+    });
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toContain("could not record the repository state");
+    expect(existsSync(join(result.dir, "chunks", "1", "attempts"))).toBe(false);
+    expect(JSON.parse(readFileSync(join(result.dir, "verdict.json"), "utf8")).verdict).toBe("ERROR");
+  });
+
   it("is an ERROR on exit 1, after retrying", async () => {
     const result = await runReview(script("exit-one.sh", EXIT_ONE_WORKER));
     expect(result.parsed.ok).toBe(false);
@@ -953,5 +974,31 @@ printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.
     const result = runCli(repo, earlierPath);
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("ERROR verdict");
+  });
+});
+
+describe("repoState", () => {
+  it("changes when an already-modified or an untracked file is edited again", () => {
+    const repo = makeRepo("state-");
+    writeFileSync(join(repo, "app.js"), "export const marker = 'edited-once';\n");
+    writeFileSync(join(repo, "notes.txt"), "first\n");
+    const before = repoState(repo);
+    expect(before.ok).toBe(true);
+    // git status stays " M app.js" and "?? notes.txt"; only the contents move.
+    writeFileSync(join(repo, "app.js"), "export const marker = 'edited-twice';\n");
+    const afterTracked = repoState(repo);
+    expect(afterTracked.ok).toBe(true);
+    expect(afterTracked.state).not.toBe(before.state);
+    writeFileSync(join(repo, "notes.txt"), "second\n");
+    const afterUntracked = repoState(repo);
+    expect(afterUntracked.state).not.toBe(afterTracked.state);
+    expect(repoState(repo).state).toBe(afterUntracked.state);
+  });
+
+  it("is not ok where git cannot read the repository", () => {
+    const notRepo = mkdtempSync(join(WORK, "state-none-"));
+    extraDirs.push(notRepo);
+    writeFileSync(join(notRepo, ".git"), "gitdir: ./missing\n");
+    expect(repoState(notRepo).ok).toBe(false);
   });
 });

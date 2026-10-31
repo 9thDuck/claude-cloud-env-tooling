@@ -39,6 +39,7 @@ import { fileURLToPath } from "node:url";
 import {
   CONFIG_FILE,
   DECIDED_COPY,
+  allowedBashCommands,
   chunkCharsError,
   chunkCharsFromEnv,
   blockingFromEnv,
@@ -88,16 +89,33 @@ export function stateDir(env = process.env) {
 export const REVIEWER_PERMISSIONS = join(TOOL_DIR, "reviewer-permissions.json");
 
 /**
- * The repository's HEAD and porcelain status, or null outside a repository.
- * diff-review's own run directory is gitignored, so worker run files never show.
+ * A fingerprint of everything a reviewer could change in the repository that
+ * git does not ignore: HEAD, the porcelain status, the full diff of tracked
+ * files against HEAD (so an edit to an already-modified file shows) and the
+ * content of every untracked file. Ignored paths are not covered; the
+ * reviewer's own run directory is one of them.
  * @param {string} root
- * @returns {string | null}
+ * @returns {{ ok: true, state: string } | { ok: false, error: string }}
  */
 export function repoState(root) {
   const head = git(["rev-parse", "HEAD"], root);
-  const status = git(["-c", "core.quotePath=false", "status", "--porcelain"], root);
-  if (!head.ok || !status.ok) return null;
-  return `HEAD ${head.stdout.trim()}\n${status.stdout}`;
+  if (!head.ok) return head;
+  const status = git(["-c", "core.quotePath=false", "status", "--porcelain", "--untracked-files=all"], root);
+  if (!status.ok) return status;
+  const tracked = git(["diff", "HEAD", "--binary"], root);
+  if (!tracked.ok) return tracked;
+  const untracked = git(["ls-files", "--others", "--exclude-standard", "-z"], root);
+  if (!untracked.ok) return untracked;
+  const hash = createHash("sha256").update(tracked.stdout);
+  for (const path of untracked.stdout.split("\0").filter(Boolean).sort()) {
+    hash.update(`\0${path}\0`);
+    try {
+      hash.update(readFileSync(join(root, path)));
+    } catch (error) {
+      return { ok: false, error: `could not read untracked ${path}: ${error.message}` };
+    }
+  }
+  return { ok: true, state: `HEAD ${head.stdout.trim()}\n${status.stdout}\ncontent ${hash.digest("hex")}` };
 }
 
 /**
@@ -594,7 +612,10 @@ export async function review({
   const stateBefore = repoDir === null ? null : repoState(repoDir);
   let parsed;
   let deltaOutcome = null;
-  if (!rules.ok) {
+  if (stateBefore !== null && !stateBefore.ok) {
+    // Without a before-state the read-only check cannot run, so no review starts.
+    parsed = { ok: false, error: `could not record the repository state at ${repoDir} before the review, so the read-only check cannot run: ${stateBefore.error}` };
+  } else if (!rules.ok) {
     // No rules, no review: a reviewer without them would judge from memory.
     parsed = { ok: false, error: rules.error };
   } else if (coverage.length > 0) {
@@ -638,6 +659,9 @@ export async function review({
         decidedPath,
         workdir: row.dir,
         readRoot: repoDir,
+        allowedCommands: allowedBashCommands(
+          JSON.parse(readFileSync(REVIEWER_PERMISSIONS, "utf8")),
+        ),
         delta,
       });
       writeFileSync(join(row.dir, "prompt.md"), prompt);
@@ -671,10 +695,12 @@ export async function review({
           };
   }
 
-  if (stateBefore !== null && chunkRows.length > 0) {
+  if (stateBefore !== null && stateBefore.ok && chunkRows.length > 0) {
     const stateAfter = repoState(repoDir);
-    if (stateAfter !== stateBefore) {
-      const changed = `the reviewer changed the repository at ${repoDir} (HEAD or git status differs from before the review); revert its changes and re-run`;
+    if (!stateAfter.ok || stateAfter.state !== stateBefore.state) {
+      const changed = stateAfter.ok
+        ? `the reviewer changed the repository at ${repoDir} (HEAD, git status or file contents differ from before the review); revert its changes and re-run`
+        : `could not record the repository state at ${repoDir} after the review: ${stateAfter.error}`;
       parsed = { ok: false, error: parsed.ok === false ? `${parsed.error}; also ${changed}` : changed };
     }
   }
@@ -806,8 +832,8 @@ function renderVerdictMarkdown({
     for (const entry of parsed.untested) lines.push(`- ${entry}`);
     lines.push("");
   }
-  // A blocked worker leg still reviewed the chunk; its refused calls are evidence,
-  // not something to hide behind a PASS or FAIL line.
+  // A blocked worker leg is an ERROR; its refused calls say what it was refused,
+  // so the next run's permissions or prompt can be fixed.
   const refused = chunkRows.flatMap((row) =>
     (row.refused ?? []).map((entry) => ({ index: row.index, entry })),
   );

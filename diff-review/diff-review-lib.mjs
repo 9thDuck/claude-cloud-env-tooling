@@ -147,49 +147,93 @@ export function noRetry429FromEnv(env = process.env) {
   return env.ECO_WORKER_NO_RETRY_429 !== "0";
 }
 
-/** A stream-json line that reports a rate-limit rejection. */
+/**
+ * A non-JSON status line (eco-worker's RESULT line) that reports a rate-limit
+ * rejection. JSON lines are judged by their structure instead (rateLimitEvent).
+ */
 const RATE_LIMIT_RE =
   /"error_status"\s*:\s*429|"api_error_status"\s*:\s*429|api_error_status=429|"rate_limit_error"/;
 
-/** A worker line that reports the assistant's turn cap. */
+/** A non-JSON status line that reports the assistant's turn cap. */
 const TURN_CAP_RE = /error_max_turns|turn[- ]cap/i;
 
 /**
- * The error text of a rate-limit rejection in worker log text, or null. The
- * first matching line is parsed when it is JSON so a nested error message is
- * reported instead of the whole event; otherwise the line itself is the
- * evidence.
+ * Parse one log line as a stream-json event, or null when it is not JSON.
+ * @param {string} line
+ * @returns {Record<string, any> | null}
+ */
+function jsonEvent(line) {
+  try {
+    const event = JSON.parse(line);
+    return event !== null && typeof event === "object" && !Array.isArray(event) ? event : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether a stream-json event is the API's own rate-limit report. Only system
+ * and result events count: a user or assistant event carries tool output and
+ * model text, which can quote "rate_limit_error" or "429" (a reviewer reading
+ * this file does) without any rejection having happened.
+ * @param {Record<string, any>} event
+ * @returns {boolean}
+ */
+function rateLimitEvent(event) {
+  if (event.type === "system") return event.error_status === 429 || event.error?.type === "rate_limit_error";
+  if (event.type === "result") return event.api_error_status === 429;
+  return false;
+}
+
+/**
+ * The first log line that `matches`, judging JSON lines by `jsonMatches` and
+ * other lines by `textRe`, or undefined.
+ * @param {string} text
+ * @param {(event: Record<string, any>) => boolean} jsonMatches
+ * @param {RegExp} textRe
+ * @returns {{ line: string, event: Record<string, any> | null } | undefined}
+ */
+function firstReport(text, jsonMatches, textRe) {
+  for (const line of text.split("\n")) {
+    const event = jsonEvent(line);
+    if (event === null ? textRe.test(line) : jsonMatches(event)) return { line, event };
+  }
+  return undefined;
+}
+
+/**
+ * The error text of a rate-limit rejection in worker log text, or null. A JSON
+ * event's nested error message is reported instead of the whole event;
+ * otherwise the status line itself is the evidence.
  * @param {string} text log text.
  * @returns {string | null}
  */
 export function rateLimitDetail(text) {
   if (typeof text !== "string" || text.length === 0) return null;
-  const line = text.split("\n").find((entry) => RATE_LIMIT_RE.test(entry));
-  if (line === undefined) return null;
-  let detail = line.trim();
-  try {
-    const event = JSON.parse(line);
-    const nested = event?.error;
+  const hit = firstReport(text, rateLimitEvent, RATE_LIMIT_RE);
+  if (hit === undefined) return null;
+  let detail = hit.line.trim();
+  if (hit.event !== null) {
+    const nested = hit.event.error;
     const message =
       typeof nested === "string"
         ? nested
-        : (nested?.message ?? event?.result ?? event?.message);
+        : (nested?.message ?? hit.event.result ?? hit.event.message);
     if (typeof message === "string" && message.trim().length > 0) detail = message.trim();
-  } catch {
-    // Not JSON: the matching line is the evidence.
   }
   return detail.slice(0, 400);
 }
 
 /**
- * The text of a turn-cap report in worker log text, or null.
+ * The text of a turn-cap report in worker log text, or null. As for rate
+ * limits, only a result event's subtype counts among JSON lines.
  * @param {string} text log text.
  * @returns {string | null}
  */
 export function turnCapDetail(text) {
   if (typeof text !== "string" || text.length === 0) return null;
-  const line = text.split("\n").find((entry) => TURN_CAP_RE.test(entry));
-  return line === undefined ? null : line.trim().slice(0, 400);
+  const hit = firstReport(text, (event) => event.type === "result" && event.subtype === "error_max_turns", TURN_CAP_RE);
+  return hit === undefined ? null : hit.line.trim().slice(0, 400);
 }
 
 /**
@@ -699,16 +743,33 @@ export function ruleCopies(paths) {
   return paths.map((path, index) => `./rules/${index + 1}-${path.split("/").pop()}`);
 }
 
+/**
+ * The Bash commands a permissions file allows, from its `Bash(<cmd>:*)` and
+ * `Bash(<cmd>)` allow entries, in file order.
+ * @param {{ permissions?: { allow?: unknown[] } }} permissions parsed permissions JSON.
+ * @returns {string[]}
+ */
+export function allowedBashCommands(permissions) {
+  const allow = Array.isArray(permissions?.permissions?.allow) ? permissions.permissions.allow : [];
+  return allow.flatMap((entry) => {
+    const match = typeof entry === "string" ? /^Bash\((.+?)(?::\*)?\)$/.exec(entry) : null;
+    return match === null ? [] : [match[1]];
+  });
+}
+
 /** Where the reviewer finds its copy of the decided-items file. */
 export const DECIDED_COPY = "./decided.md";
 
 /**
  * The task the reviewer is given.
- * @param {{ base: string, rules?: string[], decided?: boolean, project?: string | null, chunk?: { text: string, files: string[] }, chunkIndex?: number, chunkCount?: number, diffPath?: string, verdictPath?: string, rulePaths?: string[], decidedPath?: string | null, workdir?: string, readRoot?: string | null, delta?: { since: string, path: string, result: string } | null }} options
+ * @param {{ base: string, rules?: string[], decided?: boolean, project?: string | null, chunk?: { text: string, files: string[] }, chunkIndex?: number, chunkCount?: number, diffPath?: string, verdictPath?: string, rulePaths?: string[], decidedPath?: string | null, workdir?: string, readRoot?: string | null, allowedCommands?: string[], delta?: { since: string, path: string, result: string } | null }} options
  *   `chunk` is this run's complete patch; `diffPath`, `verdictPath` and
- *   `rulePaths` are absolute paths (the worker's cwd is the repository root, not
- *   the run directory). `rules` names the rule files when `rulePaths` is absent.
+ *   `rulePaths` are absolute paths (the worker's cwd is its chunk directory;
+ *   `readRoot`, when set, is the repository it may read). `rules` names the rule files when `rulePaths` is absent.
  *   `delta` names the earlier verdict a delta review builds on.
+ *   `allowedCommands` are the Bash commands the reviewer's permissions allow
+ *   (allowedBashCommands); the prompt names them so the reviewer does not try
+ *   another one and turn the review into an ERROR.
  * @returns {string} the prompt for the worker.
  */
 export function buildPrompt({
@@ -725,6 +786,7 @@ export function buildPrompt({
   decidedPath = null,
   workdir = "the run directory",
   readRoot = null,
+  allowedCommands = [],
   delta = null,
 }) {
   const text = typeof chunk.text === "string" ? chunk.text : "";
@@ -753,6 +815,11 @@ export function buildPrompt({
     readRoot === null
       ? `Your working directory is ${workdir}. There is no repository to read for this review; judge the diff and the rule files. The only files you may write are ${verdictPath} and the progress file named in your WORKER RULES.`
       : `Your working directory is ${workdir}, this review's run directory. The repository is at ${readRoot}: read it with Read, Grep and Glob on absolute paths under ${readRoot}, and with plain git show/log/diff/blame/rev-parse/ls-files run from your working directory, which is inside the repository (git -C is refused); that is where you verify what the diff claims. The repository is read-only for you: any edit there is refused. The only files you may write are ${verdictPath} and the progress file named in your WORKER RULES.`,
+    ...(allowedCommands.length > 0
+      ? [
+          `Bash is limited to these commands: ${allowedCommands.join(", ")}. Do not run tests, builds, node or any other command: a refused call makes the whole review an ERROR. List what you could not check that way under \`untested\` instead.`,
+        ]
+      : []),
     "",
     "Read these rule files yourself before judging; do not rely on memory or on this prompt:",
     ...copies.map((copy) => `- ${copy}`),
