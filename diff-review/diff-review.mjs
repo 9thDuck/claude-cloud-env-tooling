@@ -576,7 +576,8 @@ function readChunkVerdict(verdictPath, run, logDir) {
  * worker finished first. The verdicts are merged (any chunk ERROR => ERROR, else
  * any FAIL => FAIL), and a chunk set that does not cover every file in the diff
  * is an ERROR. A diff that yields no chunks is an ERROR too: a review that
- * looked at nothing cannot be a PASS.
+ * looked at nothing cannot be a PASS. A diff that cannot be split or decoded
+ * (a git path that is not UTF-8, say) ends in an ERROR verdict as well.
  *
  * A chunk that reports a rate limit (429) cancels every other chunk worker and
  * makes the whole review an ERROR; no further chunks are started. A turn-capped
@@ -622,8 +623,18 @@ export async function review({
   const repoDir = readRoot === null ? null : resolve(readRoot);
   // The whole diff stays as evidence; each chunk gets its own patch file.
   writeFileSync(join(dir, "diff.patch"), diff);
-  const split = splitDiff(diff, { maxChars });
-  const coverage = coverageProblems(diff, split.chunks);
+  // A diff this tool cannot split or decode (a git path that is not UTF-8, say)
+  // is a review it cannot run. The catch keeps the run on the fail-closed path
+  // below, so it still ends in an ERROR verdict rather than a stack trace.
+  let split = { chunks: [], files: [] };
+  let coverage = [];
+  let diffError = null;
+  try {
+    split = splitDiff(diff, { maxChars });
+    coverage = coverageProblems(diff, split.chunks);
+  } catch (error) {
+    diffError = error.message;
+  }
   const chunkRows = split.chunks.map((chunk, index) => {
     const chunkIndex = index + 1;
     // Every chunk, even the only one, has its own directory: <run>/verdict.json
@@ -660,7 +671,10 @@ export async function review({
   const stateBefore = repoDir === null ? null : repoState(repoDir);
   let parsed;
   let deltaOutcome = null;
-  if (!reviewerCommands.ok) {
+  if (diffError !== null) {
+    // Nothing downstream can be trusted without the split and its coverage.
+    parsed = { ok: false, error: diffError };
+  } else if (!reviewerCommands.ok) {
     // The prompt must name the reviewer's commands, or its first guess blocks the run.
     parsed = { ok: false, error: reviewerCommands.error };
   } else if (stateBefore !== null && !stateBefore.ok) {
