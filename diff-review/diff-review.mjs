@@ -240,7 +240,9 @@ function readVerdictFile(verdictPath) {
  * `logDir`. eco-worker writes one blocked.md per leg and lists each refused
  * command there; the newline-delimited "- " lines are the commands. Empty only
  * when the directory was read and holds no *.blocked.md file; a directory or
- * file that cannot be read yields one line saying so, never an empty list.
+ * file that cannot be read yields one line saying so; a readable newest file
+ * with no "- " line yields one line saying it lists no refused call. Never an
+ * empty list except the first case.
  * @param {string} logDir
  * @returns {string[]}
  */
@@ -258,11 +260,14 @@ function refusedCalls(logDir) {
   }
   if (newest === undefined) return [];
   try {
-    return readFileSync(join(logDir, newest), "utf8")
+    const calls = readFileSync(join(logDir, newest), "utf8")
       .split("\n")
       .filter((line) => line.startsWith("- "))
       .map((line) => line.slice(2).trim())
       .filter((line) => line.length > 0);
+    if (calls.length === 0)
+      return [`${join(logDir, newest)} was written but lists no refused call`];
+    return calls;
   } catch (error) {
     return [`could not read the refused calls in ${join(logDir, newest)}: ${error.message}`];
   }
