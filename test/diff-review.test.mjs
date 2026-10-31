@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -11,7 +12,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { workerTimeoutSeconds } from "../diff-review/diff-review-lib.mjs";
@@ -232,6 +233,55 @@ describe("CLI", () => {
     });
     expect(result.status).toBe(1);
     expect(result.stderr + result.stdout).toContain("DIFF_REVIEW_CHUNK_CHARS=1 is not an integer of at least 5000");
+  });
+});
+
+// The CLI finds its tool files from its own path, so a copy of the tool with
+// its own XDG state is a complete installation. The state holds a fresh passing
+// self-test record, so the one file a test removes is the only fault --status
+// can report.
+describe("CLI: --status requires reviewer-permissions.json", () => {
+  const TOOL = resolve(import.meta.dirname, "..", "diff-review");
+
+  function toolCopy(prefix) {
+    const copy = mkdtempSync(join(WORK, prefix));
+    extraDirs.push(copy);
+    cpSync(TOOL, copy, { recursive: true });
+    const stateHome = mkdtempSync(join(WORK, "status-state-"));
+    extraDirs.push(stateHome);
+    const state = join(stateHome, "diff-review");
+    mkdirSync(state, { recursive: true });
+    // Newer than every copied file, so freshness is not what --status reports.
+    writeFileSync(
+      join(state, "self-test.json"),
+      `${JSON.stringify({
+        at: new Date(Date.now() + 60_000).toISOString(),
+        badVerdict: "FAIL",
+        goodVerdict: "PASS",
+        pass: true,
+      })}\n`,
+    );
+    return { path: join(copy, "diff-review.mjs"), env: { ...process.env, XDG_STATE_HOME: stateHome } };
+  }
+
+  function runStatus(tool) {
+    return spawnSync("node", [tool.path, "--status"], { encoding: "utf8", env: tool.env });
+  }
+
+  it("fails naming reviewer-permissions.json when it is missing", () => {
+    const tool = toolCopy("status-missing-");
+    rmSync(join(dirname(tool.path), "reviewer-permissions.json"));
+    const result = runStatus(tool);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("missing");
+    expect(result.stdout).toContain("reviewer-permissions.json");
+  });
+
+  it("does not report reviewer-permissions.json missing when it is present", () => {
+    const tool = toolCopy("status-present-");
+    const result = runStatus(tool);
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain("reviewer-permissions.json");
   });
 });
 
