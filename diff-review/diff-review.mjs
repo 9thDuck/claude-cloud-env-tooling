@@ -221,17 +221,77 @@ export function fixtureHashProblems(dir) {
 }
 
 /**
+ * Parse a verdict file, or null when it is absent. A read error is a verdict
+ * error, never an exception.
+ * @param {string} verdictPath absolute path the prompt told the worker to write.
+ * @returns {ReturnType<typeof parseVerdict> | null}
+ */
+function readVerdictFile(verdictPath) {
+  if (!existsSync(verdictPath)) return null;
+  try {
+    return parseVerdict(readFileSync(verdictPath, "utf8"));
+  } catch (error) {
+    return { ok: false, error: `verdict.json could not be read: ${error.message}` };
+  }
+}
+
+/**
+ * The refused-call lines from the newest *.blocked.md a worker leg left in
+ * `logDir`. eco-worker writes one blocked.md per leg and lists each refused
+ * command there; the newline-delimited "- " lines are the commands. Empty only
+ * when the directory was read and holds no *.blocked.md file; a directory or
+ * file that cannot be read yields one line saying so; a readable newest file
+ * with no "- " line yields one line saying it lists no refused call. Never an
+ * empty list except the first case.
+ * @param {string} logDir
+ * @returns {string[]}
+ */
+function refusedCalls(logDir) {
+  let newest;
+  try {
+    const files = readdirSync(logDir)
+      .filter((name) => name.endsWith(".blocked.md"))
+      .map((name) => ({ name, mtime: statSync(join(logDir, name)).mtimeMs }))
+      // Newest first; on an mtime tie the later run id (a later leg) sorts first.
+      .sort((left, right) => right.mtime - left.mtime || (left.name < right.name ? 1 : -1));
+    newest = files[0]?.name;
+  } catch (error) {
+    return [`could not read the refused calls in ${logDir}: ${error.message}`];
+  }
+  if (newest === undefined) return [];
+  try {
+    const calls = readFileSync(join(logDir, newest), "utf8")
+      .split("\n")
+      .filter((line) => line.startsWith("- "))
+      .map((line) => line.slice(2).trim())
+      .filter((line) => line.length > 0);
+    if (calls.length === 0)
+      return [`${join(logDir, newest)} was written but lists no refused call`];
+    return calls;
+  } catch (error) {
+    return [`could not read the refused calls in ${join(logDir, newest)}: ${error.message}`];
+  }
+}
+
+/**
  * Run the worker once, retrying once on a non-zero exit.
  *
  * The worker's working directory is the repository root, so Read/Grep/Glob and
  * read-only git work there. Its logs go to `logDir` (inside the run directory)
  * through eco-worker's ECO_WORKER_LOG_DIR, and its verdict is written to the
  * absolute `verdictPath` given in the prompt.
+ *
+ * Exit 4 means eco-worker was blocked because at least one optional Bash call
+ * was refused. When the leg still wrote a parseable verdict.json the review is
+ * usable, so it is accepted without a retry and the refusals are reported.
+ * Exit 4 without a valid verdict, and every other non-zero exit, is retried and
+ * then reported as an ERROR.
  * @param {{ workdir: string, logDir: string, verdictPath: string, prompt: string }} options
- * @returns {{ ok: true, retried: boolean } | { ok: false, error: string, retried: boolean }}
+ * @returns {{ ok: true, blocked: boolean, retried: boolean } | { ok: false, error: string, retried: boolean }}
  */
 function runWorker({ workdir, logDir, verdictPath, prompt }) {
   const worker = workerCommand();
+  let lastStatus = null;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     // A retry must never read the previous attempt's verdict.
     rmSync(verdictPath, { force: true });
@@ -250,39 +310,57 @@ function runWorker({ workdir, logDir, verdictPath, prompt }) {
         error: `${worker} could not start: ${result.error.message}`,
         retried: attempt > 1,
       };
-    if (result.status === 0) return { ok: true, retried: attempt > 1 };
+    if (result.status === 0) return { ok: true, blocked: false, retried: attempt > 1 };
+    lastStatus = result.status;
+    // A blocked leg that still wrote its verdict reviewed the chunk; accept it.
+    if (result.status === 4 && readVerdictFile(verdictPath)?.ok === true)
+      return { ok: true, blocked: true, retried: attempt > 1 };
     // Loud: a failed reviewer run is a failed review, never a quiet PASS.
     console.error(`[diff-review] FAILED: worker exited ${result.status} on attempt ${attempt}/2`);
   }
-  return { ok: false, error: "the worker exited non-zero twice", retried: true };
+  const error =
+    lastStatus === 4
+      ? "the worker exited 4 (blocked) twice without a valid verdict.json"
+      : `the worker exited ${lastStatus} twice`;
+  return { ok: false, error, retried: true };
 }
 
 /**
  * Read one chunk's verdict.json after its worker run. Errors are values, never
- * exceptions: a missing or malformed file is an ERROR for that chunk.
+ * exceptions: a missing or malformed file is an ERROR for that chunk. A blocked
+ * run's refused calls are carried alongside the verdict so they reach verdict.md.
  * @param {string} verdictPath absolute path the prompt told the worker to write.
- * @param {{ ok: true, retried: boolean } | { ok: false, error: string, retried: boolean }} run
- * @returns {{ parsed: ReturnType<typeof parseVerdict>, workerNote: string }}
+ * @param {{ ok: true, blocked: boolean, retried: boolean } | { ok: false, error: string, retried: boolean }} run
+ * @param {string} logDir
+ * @returns {{ parsed: ReturnType<typeof parseVerdict>, workerNote: string, refused: string[] }}
  */
-function readChunkVerdict(verdictPath, run) {
+function readChunkVerdict(verdictPath, run, logDir) {
   if (!run.ok) {
-    return { parsed: { ok: false, error: run.error }, workerNote: `ERROR: ${run.error}` };
-  }
-  if (!existsSync(verdictPath)) {
-    // Never trust the worker's stdout; a run that wrote no file reviewed nothing.
-    const parsed = {
-      ok: false,
-      error: `the worker exited 0 but wrote no verdict.json (${verdictPath})`,
+    return {
+      parsed: { ok: false, error: run.error },
+      workerNote: `ERROR: ${run.error}`,
+      refused: refusedCalls(logDir),
     };
-    return { parsed, workerNote: `ERROR: ${parsed.error}` };
   }
-  let parsed;
-  try {
-    parsed = parseVerdict(readFileSync(verdictPath, "utf8"));
-  } catch (error) {
-    parsed = { ok: false, error: `verdict.json could not be read: ${error.message}` };
+  const parsed = readVerdictFile(verdictPath);
+  if (parsed === null) {
+    // Never trust the worker's stdout; a run that wrote no file reviewed nothing.
+    const error = run.blocked
+      ? `the worker exited 4 (blocked) but wrote no verdict.json (${verdictPath})`
+      : `the worker exited 0 but wrote no verdict.json (${verdictPath})`;
+    return { parsed: { ok: false, error }, workerNote: `ERROR: ${error}`, refused: refusedCalls(logDir) };
   }
-  return { parsed, workerNote: run.retried ? "exited non-zero once; the retry succeeded" : "exit 0" };
+  if (run.blocked)
+    return {
+      parsed,
+      workerNote: "exit 4 (blocked): refused calls listed",
+      refused: refusedCalls(logDir),
+    };
+  return {
+    parsed,
+    workerNote: run.retried ? "exited non-zero once; the retry succeeded" : "exit 0",
+    refused: [],
+  };
 }
 
 /**
@@ -337,6 +415,7 @@ export function review({
       oversize: chunk.oversize === true,
       parsed: null,
       workerNote: "not run",
+      refused: [],
     };
   });
 
@@ -388,9 +467,10 @@ export function review({
         verdictPath,
         prompt,
       });
-      const verdict = readChunkVerdict(verdictPath, run);
+      const verdict = readChunkVerdict(verdictPath, run, row.dir);
       row.parsed = verdict.parsed;
       row.workerNote = verdict.workerNote;
+      row.refused = verdict.refused;
       results.push({ index: row.index, parsed: verdict.parsed });
     }
     parsed = mergeVerdicts(results);
@@ -481,6 +561,15 @@ function renderVerdictMarkdown({
     for (const entry of parsed.untested) lines.push(`- ${entry}`);
     lines.push("");
   }
+  // A blocked worker leg still reviewed the chunk; its refused calls are evidence,
+  // not something to hide behind a PASS or FAIL line.
+  const refused = chunkRows.flatMap((row) =>
+    (row.refused ?? []).map((entry) => ({ index: row.index, entry })),
+  );
+  lines.push("## Untested / refused calls", "");
+  if (refused.length === 0) lines.push("None.");
+  for (const { index, entry } of refused) lines.push(`- chunk ${index}: ${entry}`);
+  lines.push("");
   return `${lines.join("\n")}\n`;
 }
 
