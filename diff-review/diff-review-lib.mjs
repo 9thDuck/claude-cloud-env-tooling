@@ -12,17 +12,11 @@
  */
 
 /**
- * Largest diff (in characters) this tool was originally willing to hand over in
- * one piece. Review chunking uses DIFF_REVIEW_CHUNK_CHARS instead; this remains
- * the ceiling named in decide()'s truncated-diff message. Nothing is truncated.
- */
-export const MAX_DIFF_CHARS = 200000;
-
-/**
  * Target chunk size (in characters) for one reviewer run. It is deliberately
- * smaller than MAX_DIFF_CHARS: the reviewer reads the repository to verify the
- * diff, so its run time grows with the chunk it is given. A bigger diff is split
- * by file (and a bigger file by hunk) so every file is reviewed; see splitDiff.
+ * smaller than the old 200,000-character one-piece limit: the reviewer reads
+ * the repository to verify the diff, so its run time grows with the chunk it is
+ * given. A bigger diff is split by file (and a bigger file by hunk) so every
+ * file is reviewed; see splitDiff.
  */
 export const DIFF_REVIEW_CHUNK_CHARS = 60000;
 

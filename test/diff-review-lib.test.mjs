@@ -271,8 +271,9 @@ describe("splitDiff", () => {
 describe("DIFF_REVIEW_CHUNK_CHARS", () => {
   it("defaults review chunks to 60,000 characters, below the old 200,000 limit", () => {
     expect(DIFF_REVIEW_CHUNK_CHARS).toBe(60000);
-    // Three ~24k files: 72k total, so one chunk under the old 200k default and
-    // two chunks under the review target. The worker timeout grows with a chunk.
+    // Three files of about 48k each (a 24k removal plus a 24k addition), about
+    // 144k in total: under the old 200k limit, and one chunk per file under the
+    // review target. The worker timeout grows with a chunk.
     const big = () => `@@ -1 +1 @@\n-${"x".repeat(24000)}\n+${"y".repeat(24000)}`;
     const diff = ["src/a.js", "src/b.js", "src/c.js"].map((path) => fileSection(path, [big()])).join("\n");
     expect(diff.length).toBeGreaterThan(DIFF_REVIEW_CHUNK_CHARS);
