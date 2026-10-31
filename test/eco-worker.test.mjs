@@ -37,6 +37,8 @@ describe("deny-hook.sh", () => {
     "git commit -m 'msg' '--amend'",
     "echo ok && git reset --hard",
     "git checkout -f main",
+    "git checkout -- src/file.ts",
+    "git checkout HEAD -- src/file.ts",
     "rm -fr build",
     "gh pr list",
   ])("refuses %s", (command) => {
@@ -45,7 +47,7 @@ describe("deny-hook.sh", () => {
     expect(result.stderr).toContain("eco-worker refused this command");
   });
 
-  it.each(["git status", "git commit -m 'mention --amend in text'", "rm file.txt", "ls -la"])("allows %s", (command) => {
+  it.each(["git status", "git checkout --detach abc123", "git commit -m 'mention --amend in text'", "rm file.txt", "ls -la"])("allows %s", (command) => {
     expect(hook(command).status).toBe(0);
   });
 });
