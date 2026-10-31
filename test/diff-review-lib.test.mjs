@@ -95,8 +95,8 @@ describe("decide", () => {
     expect(decide({ parsed, blocking: true }).exitCode).toBe(1);
   });
 
-  it("refuses a PASS on a truncated diff", () => {
-    const decision = decide({ parsed: pass, blocking: false, truncated: true });
+  it("refuses a PASS when a chunk is larger than the chunk limit", () => {
+    const decision = decide({ parsed: pass, blocking: false, oversize: true });
     expect(decision.exitCode).toBe(1);
     expect(decision.line).toContain("ERROR");
   });
@@ -190,6 +190,23 @@ describe("buildPrompt", () => {
 });
 
 describe("splitFileSections", () => {
+  it("splits a plain diff -u patch with several files after each file's hunks", () => {
+    const diff = "--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-a\n+b\n--- a/y.txt\n+++ b/y.txt\n@@ -1,2 +1 @@\n-c\n-d\n+e\n";
+    expect(splitFileSections(diff).map((section) => section.path)).toEqual(["x.txt", "y.txt"]);
+    expect(filesInDiff(diff)).toEqual(["x.txt", "y.txt"]);
+  });
+
+  it("decodes git's octal-quoted non-ASCII paths", () => {
+    const quoted = '"a/caf\\303\\251.txt" "b/caf\\303\\251.txt"';
+    const diff = `diff --git ${quoted}\n--- "a/caf\\303\\251.txt"\n+++ "b/caf\\303\\251.txt"\n@@ -1 +1 @@\n-a\n+b\n`;
+    expect(filesInDiff(diff)).toEqual(["café.txt"]);
+    expect(splitFileSections(diff).map((section) => section.path)).toEqual(["café.txt"]);
+  });
+
+  it("reports a quoted path it cannot decode instead of guessing", () => {
+    expect(() => filesInDiff('diff --git "a/x\\q" "b/x\\q"\n')).toThrow(/cannot unquote git path/);
+  });
+
   it("keeps every byte and names each file", () => {
     const diff = `${fileSection("src/a.js")}\n${fileSection("docs/b.md")}\n`;
     const sections = splitFileSections(diff);
@@ -332,10 +349,10 @@ describe("workerTimeoutSeconds", () => {
   });
 
   it("never times out before the turn cap: 30s per turn wins when larger", () => {
-    // 20K default chunk: 50 turns = 1500s beats the 1200s size formula.
-    expect(workerTimeoutSeconds(20000, {})).toBe(1500);
-    // 52K chunk (the P1a case): 82 turns = 2460s beats 1800s.
-    expect(workerTimeoutSeconds(52000, {})).toBe(2460);
+    // 20K default chunk: 60 turns = 1800s beats the 1200s size formula.
+    expect(workerTimeoutSeconds(20000, {})).toBe(1800);
+    // 52K chunk (the P1a case): 92 turns = 2760s beats 1800s.
+    expect(workerTimeoutSeconds(52000, {})).toBe(2760);
     // A raised DIFF_REVIEW_MAX_TURNS raises the timeout with it.
     expect(workerTimeoutSeconds(20000, { DIFF_REVIEW_MAX_TURNS: "200" })).toBe(6000);
   });
@@ -440,6 +457,13 @@ describe("parseEarlierVerdict", () => {
     const parsed = parseEarlierVerdict(noFindings);
     expect(parsed.ok).toBe(false);
     expect(parsed.error).toContain("no readable findings");
+  });
+
+  it("keeps an absent why empty instead of inventing one", () => {
+    const noWhy = verdictMd("FAIL").replace("- `src/a.js:3` No secrets — adds a key", "- `src/a.js:3` No secrets");
+    const parsed = parseEarlierVerdict(noWhy);
+    expect(parsed.ok).toBe(true);
+    expect(parsed.findings).toEqual([{ file: "src/a.js", line: 3, rule: "No secrets", why: "" }]);
   });
 });
 
@@ -597,10 +621,17 @@ describe("concurrencyFromEnv", () => {
 
 describe("maxTurnsFor", () => {
   it("scales the default cap with the chunk size", () => {
-    expect(maxTurnsFor(20000, {})).toBe(50);
-    expect(maxTurnsFor(51844, {})).toBe(82);
-    expect(maxTurnsFor(60000, {})).toBe(90);
-    expect(maxTurnsFor(0, {})).toBe(30);
+    expect(maxTurnsFor(20000, {})).toBe(60);
+    expect(maxTurnsFor(51844, {})).toBe(92);
+    expect(maxTurnsFor(60000, {})).toBe(100);
+    expect(maxTurnsFor(0, {})).toBe(40);
+  });
+
+  it("never gives a small chunk fewer than the old fixed 40 turns", () => {
+    for (const n of [0, 1, 500, 5000, 9000]) {
+      expect(maxTurnsFor(n, {})).toBeGreaterThanOrEqual(40);
+    }
+    expect(maxTurnsFor(5000, {})).toBe(45);
   });
 
   it("lets a positive integer DIFF_REVIEW_MAX_TURNS win", () => {
@@ -608,9 +639,9 @@ describe("maxTurnsFor", () => {
   });
 
   it("ignores a non-positive or non-numeric override", () => {
-    expect(maxTurnsFor(20000, { DIFF_REVIEW_MAX_TURNS: "0" })).toBe(50);
-    expect(maxTurnsFor(20000, { DIFF_REVIEW_MAX_TURNS: "-3" })).toBe(50);
-    expect(maxTurnsFor(20000, { DIFF_REVIEW_MAX_TURNS: "many" })).toBe(50);
+    expect(maxTurnsFor(20000, { DIFF_REVIEW_MAX_TURNS: "0" })).toBe(60);
+    expect(maxTurnsFor(20000, { DIFF_REVIEW_MAX_TURNS: "-3" })).toBe(60);
+    expect(maxTurnsFor(20000, { DIFF_REVIEW_MAX_TURNS: "many" })).toBe(60);
   });
 });
 
@@ -677,6 +708,16 @@ describe("rateLimitDetail", () => {
     expect(rateLimitDetail(log)).toBeNull();
     expect(rateLimitDetail(`${log}\n{"type":"result","api_error_status":429,"result":"quota gone"}`)).toBe("quota gone");
   });
+
+  it("ignores 429 text echoed in a user/assistant event or in plain output", () => {
+    const echoed = [
+      '{"type":"user","api_error_status":429,"message":{"content":[{"type":"tool_result","content":"api_error_status=429"}]}}',
+      '{"type":"assistant","error":{"type":"rate_limit_error","message":"quoted from a file"},"message":{}}',
+      "the file says api_error_status=429 but nothing was rejected",
+      'log text: "rate_limit_error"',
+    ].join("\n");
+    expect(rateLimitDetail(echoed)).toBeNull();
+  });
 });
 
 describe("turnCapDetail", () => {
@@ -691,5 +732,14 @@ describe("turnCapDetail", () => {
     expect(turnCapDetail("max_turns=40 turns=3")).toBeNull();
     expect(turnCapDetail('{"type":"result","is_error":false,"result":"ok"}')).toBeNull();
     expect(turnCapDetail('{"type":"user","message":{"content":"error_max_turns and the turn cap"}}')).toBeNull();
+  });
+
+  it("ignores turn-cap text echoed in a user/assistant event or in prose", () => {
+    const echoed = [
+      '{"type":"user","subtype":"error_max_turns","message":{"content":[{"type":"tool_result","content":"error_max_turns"}]}}',
+      '{"type":"assistant","message":{"content":"the TURN CAP is 40"},"subtype":"error_max_turns"}',
+      "the worker's source mentions error_max_turns and turn cap",
+    ].join("\n");
+    expect(turnCapDetail(echoed)).toBeNull();
   });
 });

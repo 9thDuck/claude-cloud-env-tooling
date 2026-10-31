@@ -131,6 +131,25 @@ describe("eco-worker.sh", () => {
     }
   });
 
+  it("does not end the leg on 429 text echoed in a user event", () => {
+    const echo = '{"type":"user","api_error_status":429,"message":{"content":[{"type":"tool_result","content":"api_error_status=429 \\"error_status\\":429 \\"rate_limit_error\\""}]}}';
+    const { root, workdir, env } = fakeClaude(
+      `printf '%s\\n' '${echo}'\nsleep 4\nprintf '%s\\n' '{"type":"result","is_error":false,"result":"done","permission_denials":[]}'`,
+    );
+    try {
+      const result = spawnSync(tool("eco-worker.sh"), ["-t", "20", "-d", workdir, "do a thing"], {
+        encoding: "utf8",
+        env: { ...env, ECO_WORKER_NO_RETRY_429: "1" },
+      });
+      expect(result.status).toBe(0);
+      const status = statusText(root);
+      expect(status).toContain("RESULT=ok");
+      expect(status).not.toContain("api_error_status=429");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("lets the API client retry a 429 when ECO_WORKER_NO_RETRY_429=0", () => {
     const { root, workdir, env } = fakeClaude(
       `printf '%s\\n' '{"type":"system","subtype":"api_retry","error_status":429}'\nsleep 1\nprintf '%s\\n' '{"type":"result","is_error":false,"result":"done","permission_denials":[]}'`,

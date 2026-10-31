@@ -12,14 +12,7 @@
  */
 
 /**
- * Largest diff (in characters) this tool was originally willing to hand over in
- * one piece. Review chunking uses DIFF_REVIEW_CHUNK_CHARS instead; this remains
- * the ceiling named in decide()'s truncated-diff message. Nothing is truncated.
- */
-export const MAX_DIFF_CHARS = 200000;
-
-/**
- * Default chunk size (in characters) for one reviewer run. It is deliberately
+ * Target chunk size (in characters) for one reviewer run. It is deliberately
  * small: the reviewer reads the repository to verify the diff, so its turns and
  * run time grow with the chunk it is given (a 52K chunk needed more than 40
  * turns). A bigger diff is split by file (and a bigger file by hunk) so every
@@ -114,15 +107,19 @@ export function concurrencyFromEnv(env = process.env) {
   return DEFAULT_CONCURRENCY;
 }
 
-/** Turns every chunk worker may take before the per-1000-character allowance. */
-export const MAX_TURNS_BASE = 30;
+/**
+ * Turns every chunk worker may take before the per-1000-character allowance;
+ * 40 was the old fixed cap, so a small chunk never gets fewer turns than before.
+ */
+export const MAX_TURNS_BASE = 40;
 /** Extra turns allowed for every 1000 characters of the chunk. */
 export const MAX_TURNS_PER_1000_CHARS = 1;
 
 /**
  * The per-chunk turn cap. A positive integer DIFF_REVIEW_MAX_TURNS wins;
- * otherwise it is derived from the chunk size (30 + 1 per 1000 characters), so
- * a default run cannot hit the cap on its own chunking. The cap is passed to
+ * otherwise it is derived from the chunk size (40 + 1 per started 1000
+ * characters): a bigger chunk needs more reads, so it gets more turns. This
+ * does not guarantee a reviewer finishes within the cap. The cap is passed to
  * eco-worker as ECO_WORKER_MAX_TURNS; a chunk that reaches it without a valid
  * verdict is an ERROR, never a PASS.
  * @param {number} chunkChars characters in the chunk.
@@ -148,92 +145,97 @@ export function noRetry429FromEnv(env = process.env) {
 }
 
 /**
- * A non-JSON status line (eco-worker's RESULT line) that reports a rate-limit
- * rejection. JSON lines are judged by their structure instead (rateLimitEvent).
- */
-const RATE_LIMIT_RE =
-  /"error_status"\s*:\s*429|"api_error_status"\s*:\s*429|api_error_status=429|"rate_limit_error"/;
-
-/** A non-JSON status line that reports the assistant's turn cap. */
-const TURN_CAP_RE = /error_max_turns|turn[- ]cap/i;
-
-/**
- * Parse one log line as a stream-json event, or null when it is not JSON.
+ * `line` as a JSON object, or null when it is not one.
  * @param {string} line
  * @returns {Record<string, any> | null}
  */
-function jsonEvent(line) {
+function jsonObject(line) {
   try {
-    const event = JSON.parse(line);
-    return event !== null && typeof event === "object" && !Array.isArray(event) ? event : null;
+    const value = JSON.parse(line);
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
   } catch {
     return null;
   }
 }
 
+/** eco-worker's own status lines start this way; the rest of a log is stream-json. */
+function isWorkerStatusLine(line) {
+  return line.startsWith("eco-worker:") || line.startsWith("RESULT=");
+}
+
 /**
- * Whether a stream-json event is the API's own rate-limit report. Only system
- * and result events count: a user or assistant event carries tool output and
- * model text, which can quote "rate_limit_error" or "429" (a reviewer reading
- * this file does) without any rejection having happened.
- * @param {Record<string, any>} event
+ * A line that reports a rate-limit rejection: a stream-json event whose
+ * top-level api_error_status or error_status is 429, or whose error.type is
+ * "rate_limit_error"; or an eco-worker status line carrying the
+ * api_error_status=429 field. A user/assistant event never counts: its text can
+ * echo a tool_result that quotes this file or a log mentioning 429.
+ * @param {string} line
  * @returns {boolean}
  */
-function rateLimitEvent(event) {
-  if (event.type === "system") return event.error_status === 429 || event.error?.type === "rate_limit_error";
-  if (event.type === "result") return event.api_error_status === 429;
-  return false;
-}
-
-/**
- * The first log line that `matches`, judging JSON lines by `jsonMatches` and
- * other lines by `textRe`, or undefined.
- * @param {string} text
- * @param {(event: Record<string, any>) => boolean} jsonMatches
- * @param {RegExp} textRe
- * @returns {{ line: string, event: Record<string, any> | null } | undefined}
- */
-function firstReport(text, jsonMatches, textRe) {
-  for (const line of text.split("\n")) {
-    const event = jsonEvent(line);
-    if (event === null ? textRe.test(line) : jsonMatches(event)) return { line, event };
+function isRateLimitLine(line) {
+  const event = jsonObject(line);
+  if (event !== null) {
+    if (event.type === "user" || event.type === "assistant") return false;
+    const status = event.api_error_status ?? event.error_status;
+    return status === 429 || status === "429" || event.error?.type === "rate_limit_error";
   }
-  return undefined;
+  return isWorkerStatusLine(line) && /(?:^|\s)api_error_status=429(?:\s|$)/.test(line);
 }
 
 /**
- * The error text of a rate-limit rejection in worker log text, or null. A JSON
- * event's nested error message is reported instead of the whole event;
- * otherwise the status line itself is the evidence.
+ * A line that reports the assistant's turn cap: a stream-json event whose
+ * subtype is "error_max_turns", or an eco-worker status line carrying the
+ * error=error_max_turns field. A user/assistant event never counts; neither
+ * does prose that merely mentions the words.
+ * @param {string} line
+ * @returns {boolean}
+ */
+function isTurnCapLine(line) {
+  const event = jsonObject(line);
+  if (event !== null) {
+    if (event.type === "user" || event.type === "assistant") return false;
+    return event.subtype === "error_max_turns";
+  }
+  return isWorkerStatusLine(line) && /(?:^|\s)error=error_max_turns\b/.test(line);
+}
+
+/**
+ * The error text of a rate-limit rejection in worker log text, or null. The
+ * first matching line (see isRateLimitLine) is parsed when it is JSON so a
+ * nested error message is reported instead of the whole event; otherwise the
+ * line itself is the evidence.
  * @param {string} text log text.
  * @returns {string | null}
  */
 export function rateLimitDetail(text) {
   if (typeof text !== "string" || text.length === 0) return null;
-  const hit = firstReport(text, rateLimitEvent, RATE_LIMIT_RE);
-  if (hit === undefined) return null;
-  let detail = hit.line.trim();
-  if (hit.event !== null) {
-    const nested = hit.event.error;
+  const line = text.split("\n").find(isRateLimitLine);
+  if (line === undefined) return null;
+  let detail = line.trim();
+  try {
+    const event = JSON.parse(line);
+    const nested = event?.error;
     const message =
       typeof nested === "string"
         ? nested
-        : (nested?.message ?? hit.event.result ?? hit.event.message);
+        : (nested?.message ?? event?.result ?? event?.message);
     if (typeof message === "string" && message.trim().length > 0) detail = message.trim();
+  } catch {
+    // Not JSON: the matching line is the evidence.
   }
   return detail.slice(0, 400);
 }
 
 /**
- * The text of a turn-cap report in worker log text, or null. As for rate
- * limits, only a result event's subtype counts among JSON lines.
+ * The text of a turn-cap report in worker log text, or null. See isTurnCapLine
+ * for what counts.
  * @param {string} text log text.
  * @returns {string | null}
  */
 export function turnCapDetail(text) {
   if (typeof text !== "string" || text.length === 0) return null;
-  const hit = firstReport(text, (event) => event.type === "result" && event.subtype === "error_max_turns", TURN_CAP_RE);
-  return hit === undefined ? null : hit.line.trim().slice(0, 400);
+  const line = text.split("\n").find(isTurnCapLine);
+  return line === undefined ? null : line.trim().slice(0, 400);
 }
 
 /**
@@ -301,20 +303,49 @@ export function fileRank(path) {
   return 1;
 }
 
+const C_ESCAPES = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+
+/**
+ * Decode git's C-style quoted path (core.quotePath): `\ooo` octal bytes and
+ * the escapes in C_ESCAPES, read as UTF-8.
+ * @param {string} quoted the path with its surrounding quotes.
+ * @returns {string}
+ * @throws {Error} on an escape git does not write or bytes that are not UTF-8.
+ */
+function unquoteC(quoted) {
+  const bytes = [];
+  const body = quoted.slice(1, -1);
+  for (let index = 0; index < body.length; index += 1) {
+    const char = body[index];
+    if (char !== "\\") {
+      bytes.push(...new TextEncoder().encode(char));
+      continue;
+    }
+    const octal = /^[0-7]{3}/.exec(body.slice(index + 1));
+    if (octal !== null) {
+      bytes.push(Number.parseInt(octal[0], 8));
+      index += 3;
+      continue;
+    }
+    const code = C_ESCAPES[body[index + 1]];
+    if (code === undefined) throw new Error(`diff-review: cannot unquote git path ${quoted}`);
+    bytes.push(code);
+    index += 1;
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(bytes));
+  } catch {
+    throw new Error(`diff-review: git path ${quoted} is not UTF-8`);
+  }
+}
+
 /**
  * A git path from a header, removing the a/ or b/ prefix and quotes.
- * @param {string} value e.g. `b/src/a.js` or `"a/file with space.js"`.
+ * @param {string} value e.g. `b/src/a.js` or `"b/caf\\303\\251.js"`.
  * @returns {string}
  */
 function unquotePath(value) {
-  let path = value;
-  if (path.startsWith('"') && path.endsWith('"')) {
-    try {
-      path = JSON.parse(path);
-    } catch {
-      path = path.slice(1, -1);
-    }
-  }
+  const path = value.startsWith('"') && value.endsWith('"') ? unquoteC(value) : value;
   return path.replace(/^[ab]\//, "");
 }
 
@@ -358,8 +389,9 @@ function sectionPath(text) {
 /**
  * Split a unified diff into per-file sections, preserving every byte.
  * Sections start at `diff --git`; a plain `diff -u` header without it is also
- * recognised. Hunks are tracked so a removed line that looks like a header is
- * never mistaken for one.
+ * recognised. Hunk line counts are tracked, so a removed line that looks like a
+ * header is never mistaken for one and the next file's header is found after
+ * the last hunk.
  * @param {string} diff
  * @returns {Array<{ path: string | null, text: string }>}
  */
@@ -368,11 +400,13 @@ export function splitFileSections(diff) {
   const lines = diff.split("\n");
   const sections = [];
   let current = null;
-  let inHunk = false;
+  let oldLeft = 0;
+  let newLeft = 0;
   const start = (line) => {
     current = { lines: line === null ? [] : [line] };
     sections.push(current);
-    inHunk = false;
+    oldLeft = 0;
+    newLeft = 0;
   };
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
@@ -380,6 +414,7 @@ export function splitFileSections(diff) {
       start(line);
       continue;
     }
+    const inHunk = oldLeft > 0 || newLeft > 0;
     if (!inHunk && line.startsWith("--- ") && /^\+\+\+ /.test(lines[index + 1] ?? "")) {
       const ownHeader = current !== null && current.lines.some((entry) => entry.startsWith("+++ "));
       if (current === null || ownHeader) {
@@ -389,7 +424,18 @@ export function splitFileSections(diff) {
     }
     if (current === null) start(null);
     current.lines.push(line);
-    if (line.startsWith("@@ ")) inHunk = true;
+    const hunk = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(line);
+    if (!inHunk && hunk !== null) {
+      // Unified diff omits ",count" when the count is 1, so an absent group means 1.
+      oldLeft = Number(hunk[1] ?? 1);
+      newLeft = Number(hunk[2] ?? 1);
+    } else if (inHunk) {
+      if (line.startsWith(" ") || line === "") {
+        oldLeft -= 1;
+        newLeft -= 1;
+      } else if (line.startsWith("-")) oldLeft -= 1;
+      else if (line.startsWith("+")) newLeft -= 1;
+    }
   }
   return sections.map((section) => {
     const text = section.lines.join("\n");
@@ -593,6 +639,9 @@ function sectionLines(text, heading) {
 /**
  * The findings a verdict.md lists, in the same shape parseVerdict uses. A line
  * that cannot be read is skipped; the caller refuses a FAIL that lists none.
+ * A line without " — why" keeps an empty why: the earlier verdict gave no
+ * reason for this finding, and inventing one would put words in the reviewer's
+ * mouth.
  * @param {string} text
  * @returns {Array<{ file: string, line: number | null, rule: string, why: string }>}
  */
@@ -613,7 +662,7 @@ function findingsFromMarkdown(text) {
       file,
       line: Number.isFinite(line) ? line : null,
       rule,
-      why: why.length > 0 ? why : "carried from the earlier verdict",
+      why,
     });
   }
   return findings;
@@ -913,17 +962,18 @@ export function parseVerdict(text) {
  *
  * Blocking is the single switch for a reviewer FAIL. ERROR (the review never
  * ran or gave no valid verdict) exits 1 in both modes, so a broken review never
- * looks green; a clean PASS, or an advisory FAIL, exits 0. A PASS on a
- * truncated diff is an ERROR in both modes: the reviewer never saw all of it.
- * @param {{ parsed: ReturnType<typeof parseVerdict>, blocking?: boolean, truncated?: boolean }} options
+ * looks green; a clean PASS, or an advisory FAIL, exits 0. A PASS when a chunk
+ * was larger than the chunk limit is an ERROR in both modes: the reviewer may
+ * not have read that chunk whole.
+ * @param {{ parsed: ReturnType<typeof parseVerdict>, blocking?: boolean, oversize?: boolean }} options
  * @returns {{ exitCode: 0 | 1, line: string }}
  */
-export function decide({ parsed, blocking, truncated = false }) {
+export function decide({ parsed, blocking, oversize = false }) {
   const mode = blocking === true ? "blocking" : "advisory";
-  if (parsed.ok === true && parsed.verdict === "PASS" && truncated === true) {
+  if (parsed.ok === true && parsed.verdict === "PASS" && oversize === true) {
     return {
       exitCode: 1,
-      line: `diff-review: ERROR (${mode}) the diff was cut at ${MAX_DIFF_CHARS} characters, so a PASS cannot stand; split the change into smaller pieces`,
+      line: `diff-review: ERROR (${mode}) a chunk was larger than the chunk limit, so the reviewer may not have read it whole and a PASS cannot stand; split the change into smaller pieces`,
     };
   }
   if (parsed.ok === false) {

@@ -310,8 +310,11 @@ function readVerdictFile(verdictPath) {
 /**
  * The refused-call lines from the newest *.blocked.md a worker leg left in
  * `logDir`. eco-worker writes one blocked.md per leg and lists each refused
- * command there; the newline-delimited "- " lines are the commands. Empty when
- * the run wrote none.
+ * command there; the newline-delimited "- " lines are the commands. Empty only
+ * when the directory was read and holds no *.blocked.md file; a directory or
+ * file that cannot be read yields one line saying so; a readable newest file
+ * with no "- " line yields one line saying it lists no refused call. Never an
+ * empty list except the first case.
  * @param {string} logDir
  * @returns {string[]}
  */
@@ -321,45 +324,56 @@ function refusedCalls(logDir) {
     const files = readdirSync(logDir)
       .filter((name) => name.endsWith(".blocked.md"))
       .map((name) => ({ name, mtime: statSync(join(logDir, name)).mtimeMs }))
-      // Newest first; the run id breaks an mtime tie, later legs sort later.
+      // Newest first; on an mtime tie the later run id (a later leg) sorts first.
       .sort((left, right) => right.mtime - left.mtime || (left.name < right.name ? 1 : -1));
     newest = files[0]?.name;
-  } catch {
-    return [];
+  } catch (error) {
+    return [`could not read the refused calls in ${logDir}: ${error.message}`];
   }
   if (newest === undefined) return [];
   try {
-    return readFileSync(join(logDir, newest), "utf8")
+    const calls = readFileSync(join(logDir, newest), "utf8")
       .split("\n")
       .filter((line) => line.startsWith("- "))
       .map((line) => line.slice(2).trim())
       .filter((line) => line.length > 0);
-  } catch {
-    return [];
+    if (calls.length === 0)
+      return [`${join(logDir, newest)} was written but lists no refused call`];
+    return calls;
+  } catch (error) {
+    return [`could not read the refused calls in ${join(logDir, newest)}: ${error.message}`];
   }
 }
 
 /**
  * Everything the worker leg left in `logDir` that can report a rejection: the
- * eco-worker log and status files. Unreadable evidence is skipped.
+ * eco-worker log and status files. Unlike refusedCalls this cannot treat an
+ * unreadable file as "no rejection": a 429 in a log we cannot read must not be
+ * retried. Each unreadable path and its error are returned in `unreadable`.
  * @param {string} logDir
- * @returns {string}
+ * @returns {{ text: string, unreadable: string[] }}
  */
 function logText(logDir) {
-  let text = "";
+  let names;
   try {
-    for (const name of readdirSync(logDir)) {
-      if (!name.endsWith(".log") && !name.endsWith(".status")) continue;
-      try {
-        text += `${readFileSync(join(logDir, name), "utf8")}\n`;
-      } catch {
-        // An unreadable log cannot be evidence.
-      }
-    }
-  } catch {
-    return "";
+    names = readdirSync(logDir);
+  } catch (error) {
+    return {
+      text: "",
+      unreadable: [`could not read the worker logs in ${logDir}: ${error.message}`],
+    };
   }
-  return text;
+  const text = [];
+  const unreadable = [];
+  for (const name of names) {
+    if (!name.endsWith(".log") && !name.endsWith(".status")) continue;
+    try {
+      text.push(readFileSync(join(logDir, name), "utf8"));
+    } catch (error) {
+      unreadable.push(`could not read the worker log ${join(logDir, name)}: ${error.message}`);
+    }
+  }
+  return { text: text.join("\n"), unreadable };
 }
 
 /**
@@ -465,9 +479,13 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
     // A clean exit with a verdict is a finished chunk; nothing else is trusted.
     if (result.status === 0 && validVerdict) return { ok: true, retried: attempt > 1 };
     const evidence = logText(logDir);
+    // Unreadable evidence is a failed review, not a missing rejection: name the
+    // path and error instead of retrying past a 429 nobody could read.
+    if (evidence.unreadable.length > 0)
+      return { ok: false, error: evidence.unreadable.join("; "), retried: attempt > 1 };
     // A 429 is the quota signal this tool exists to respect: no retry, no
     // further chunks. The caller cancels every other chunk worker.
-    const rate = rateLimitDetail(evidence);
+    const rate = rateLimitDetail(evidence.text);
     if (rate !== null)
       return {
         ok: false,
@@ -477,7 +495,7 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
         retried: attempt > 1,
       };
     // The turn cap is deterministic; retrying would spend quota for the same result.
-    const cap = turnCapDetail(evidence);
+    const cap = turnCapDetail(evidence.text);
     if (cap !== null) {
       if (validVerdict) return { ok: true, turnCapped: true, retried: attempt > 1 };
       return {
@@ -557,7 +575,8 @@ function readChunkVerdict(verdictPath, run, logDir) {
  * minimum 1) at a time; results are merged in chunk order regardless of which
  * worker finished first. The verdicts are merged (any chunk ERROR => ERROR, else
  * any FAIL => FAIL), and a chunk set that does not cover every file in the diff
- * is an ERROR.
+ * is an ERROR. A diff that yields no chunks is an ERROR too: a review that
+ * looked at nothing cannot be a PASS.
  *
  * A chunk that reports a rate limit (429) cancels every other chunk worker and
  * makes the whole review an ERROR; no further chunks are started. A turn-capped
@@ -654,8 +673,15 @@ export async function review({
     // Nothing may be silently dropped.
     parsed = { ok: false, error: `diff coverage is incomplete: ${coverage.join("; ")}` };
   } else if (chunkRows.length === 0) {
-    // A delta with nothing new since the earlier verdict still gets a verdict.
-    parsed = { ok: true, verdict: "PASS", findings: [], untested: [] };
+    // Fail closed: a review of zero chunks has looked at nothing, so it cannot
+    // be a PASS. At an unchanged head the earlier verdict still covers the code.
+    parsed = {
+      ok: false,
+      error:
+        delta === null
+          ? "nothing to review: the diff is empty and no verdict was produced"
+          : `nothing changed since the earlier verdict at ${delta.since}; reuse that verdict instead of a new one`,
+    };
   } else {
     const concurrency = concurrencyFromEnv();
     console.log(
@@ -721,7 +747,7 @@ export async function review({
         ? mergeVerdicts(results)
         : {
             ok: false,
-            error: `ERROR: rate limited (429) in chunk ${rateLimit.hit.index}: ${rateLimit.hit.detail} (weekly quota may be exhausted)`,
+            error: `ERROR: rate limited (429) in chunk ${rateLimit.hit.index}: ${rateLimit.hit.detail}`,
           };
   }
 
@@ -744,7 +770,8 @@ export async function review({
     parsed = deltaOutcome.parsed;
   }
 
-  const decision = decide({ parsed, blocking, truncated: false });
+  const oversize = chunkRows.some((row) => row.oversize === true);
+  const decision = decide({ parsed, blocking, oversize });
   writeFileSync(join(dir, "verdict.json"), `${JSON.stringify(runVerdict({ parsed, base, head }), null, 2)}\n`);
   const verdictMd = join(dir, "verdict.md");
   writeFileSync(
@@ -800,6 +827,7 @@ function renderVerdictMarkdown({
     `# ${decision.line}`,
     "",
     `- at: ${new Date().toISOString()}`,
+    // A direct review() call (tests, embedders) passes no head; main() always does.
     `- head: ${head ?? "(unknown)"}`,
     `- base: ${base}`,
     ...(delta === null
@@ -855,7 +883,9 @@ function renderVerdictMarkdown({
     lines.push("## Findings", "");
     if (parsed.findings.length === 0) lines.push("None.");
     for (const finding of parsed.findings) {
-      lines.push(`- \`${finding.file}:${finding.line ?? "-"}\` ${finding.rule} — ${finding.why}`);
+      // An earlier verdict may list a finding with no why; do not add a fake one.
+      const why = finding.why.length > 0 ? ` — ${finding.why}` : "";
+      lines.push(`- \`${finding.file}:${finding.line ?? "-"}\` ${finding.rule}${why}`);
     }
     lines.push("", "## Untested", "");
     if (parsed.untested.length === 0) lines.push("None.");
@@ -944,8 +974,8 @@ export function collectDiff(root, base) {
  * The delta a `--since-verdict` review builds on: read the earlier verdict, check
  * its head is an ancestor of `head`, and collect only the changes since that
  * head. The earlier verdict must not be an ERROR and must carry a head sha; a
- * delta with no changes is still a review, so an empty delta is allowed (it
- * becomes PASS, or FAIL when the earlier verdict's findings were not re-reviewed).
+ * delta with no changes yields no chunks, and review() reports an ERROR asking
+ * for the earlier verdict to be reused rather than reviewing nothing.
  * @param {string} root repository top.
  * @param {string} sincePath path to the earlier verdict.md, as the user gave it.
  * @param {string | null} head current HEAD sha.
@@ -1184,8 +1214,11 @@ async function main(argv) {
   if (!top.ok) return setupError(top.error);
   if (options.diffFile !== null && options.sinceVerdict !== null)
     return setupError("--since-verdict cannot be combined with --diff-file; delta mode reads the repository");
+  // A repository with no commits has no HEAD: report the git error rather than
+  // writing a verdict whose "- head:" line --since-verdict could never use.
   const headResult = git(["rev-parse", "HEAD"], top.root);
-  const head = headResult.ok ? headResult.stdout.trim() : null;
+  if (!headResult.ok) return setupError(headResult.error);
+  const head = headResult.stdout.trim();
   const mergeBase = mergeBaseOf(top.root, options.base);
   const rules = mergeBase.ok ? loadRules(top.root, mergeBase.sha) : mergeBase;
   let diff;
