@@ -820,8 +820,7 @@ export function allowedBashCommands(permissions) {
  * reviewer (whose cwd is its chunk's run directory, not the repo root) can run
  * read-only git against the repository under review. The `--no-pager` twins
  * exist because `git --no-pager diff ...` does not match `Bash(git diff:*)`,
- * and that refusal turned a review into an ERROR; runWorker also sets
- * GIT_PAGER=cat so the reviewer never needs the flag. Only that root and only
+ * and that refusal turned a review into an ERROR. Only that root and only
  * allow-listed subcommands get a twin, so any other -C path or a write
  * subcommand is refused. Deny rules are copied; the input is not mutated.
  * @param {{ permissions: { allow: unknown[], deny: unknown[] } }} permissions parsed permissions JSON.

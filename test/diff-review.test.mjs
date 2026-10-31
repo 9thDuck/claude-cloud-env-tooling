@@ -84,7 +84,6 @@ prompt="$last"
 [ -n "$root" ] || { echo "no read rule" >&2; exit 1; }
 value="$(cat "$root/app.js")"
 printf 'cwd=%s\\nread app.js=%s\\n' "$PWD" "$value" > "$out/c1-read-proof.txt"
-printf '%s\\n' "\${GIT_PAGER:-}" > "$out/git-pager.txt"
 if printf '%s' "$prompt" | grep -q 'src/bad.js'; then
   printf '%s\\n' '{"verdict":"FAIL","findings":[{"file":"src/bad.js","line":1,"rule":"No stubs","why":"planted bad file"}],"untested":[]}' > "$out/verdict.json"
 else
@@ -548,25 +547,6 @@ describe("review: repo read access and chunking", () => {
     expect(result.stdout).toContain("verdict:");
   });
 
-  it("gives the reviewer GIT_PAGER=cat so git never opens a pager", () => {
-    const repo = makeRepo("git-pager-");
-    execFileSync("git", ["branch", "origin/main", "main"], { cwd: repo });
-    writeFileSync(join(repo, "change.patch"), `${fileSection("src/feature.js")}\n`);
-    const env = { ...process.env, DIFF_REVIEW_WORKER: fakeWorker };
-    // Prove the value comes from runWorker, not from this test's environment.
-    delete env.GIT_PAGER;
-    const result = spawnSync(
-      "node",
-      [resolve(import.meta.dirname, "..", "diff-review", "diff-review.mjs"), "--diff-file", "change.patch"],
-      { cwd: repo, encoding: "utf8", env },
-    );
-    expect(result.status).toBe(0);
-    const run = readdirSync(join(repo, ".diff-review"), { withFileTypes: true }).find((entry) =>
-      entry.isDirectory(),
-    );
-    const pager = readFileSync(join(repo, ".diff-review", run.name, "chunks", "1", "git-pager.txt"), "utf8");
-    expect(pager.trim()).toBe("cat");
-  });
 
   it("is a setup ERROR naming the git failure when the repository has no HEAD", () => {
     const repo = mkdtempSync(join(WORK, "no-head-"));
