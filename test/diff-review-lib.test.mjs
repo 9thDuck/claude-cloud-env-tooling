@@ -81,8 +81,8 @@ describe("decide", () => {
     expect(decide({ parsed, blocking: true }).exitCode).toBe(1);
   });
 
-  it("refuses a PASS on a truncated diff", () => {
-    const decision = decide({ parsed: pass, blocking: false, truncated: true });
+  it("refuses a PASS when a chunk is larger than the chunk limit", () => {
+    const decision = decide({ parsed: pass, blocking: false, oversize: true });
     expect(decision.exitCode).toBe(1);
     expect(decision.line).toContain("ERROR");
   });

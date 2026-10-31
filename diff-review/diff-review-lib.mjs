@@ -568,17 +568,18 @@ export function parseVerdict(text) {
  *
  * Blocking is the single switch for a reviewer FAIL. ERROR (the review never
  * ran or gave no valid verdict) exits 1 in both modes, so a broken review never
- * looks green; a clean PASS, or an advisory FAIL, exits 0. A PASS on a
- * truncated diff is an ERROR in both modes: the reviewer never saw all of it.
- * @param {{ parsed: ReturnType<typeof parseVerdict>, blocking?: boolean, truncated?: boolean }} options
+ * looks green; a clean PASS, or an advisory FAIL, exits 0. A PASS when a chunk
+ * was larger than the chunk limit is an ERROR in both modes: the reviewer may
+ * not have read that chunk whole.
+ * @param {{ parsed: ReturnType<typeof parseVerdict>, blocking?: boolean, oversize?: boolean }} options
  * @returns {{ exitCode: 0 | 1, line: string }}
  */
-export function decide({ parsed, blocking, truncated = false }) {
+export function decide({ parsed, blocking, oversize = false }) {
   const mode = blocking === true ? "blocking" : "advisory";
-  if (parsed.ok === true && parsed.verdict === "PASS" && truncated === true) {
+  if (parsed.ok === true && parsed.verdict === "PASS" && oversize === true) {
     return {
       exitCode: 1,
-      line: `diff-review: ERROR (${mode}) the diff was cut at ${MAX_DIFF_CHARS} characters, so a PASS cannot stand; split the change into smaller pieces`,
+      line: `diff-review: ERROR (${mode}) a chunk was larger than the chunk limit, so the reviewer may not have read it whole and a PASS cannot stand; split the change into smaller pieces`,
     };
   }
   if (parsed.ok === false) {

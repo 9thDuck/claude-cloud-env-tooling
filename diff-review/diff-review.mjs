@@ -396,7 +396,8 @@ export function review({
     parsed = mergeVerdicts(results);
   }
 
-  const decision = decide({ parsed, blocking, truncated: false });
+  const oversize = chunkRows.some((row) => row.oversize === true);
+  const decision = decide({ parsed, blocking, oversize });
   const verdictMd = join(dir, "verdict.md");
   writeFileSync(
     verdictMd,

@@ -267,6 +267,25 @@ describe("review: repo read access and chunking", () => {
     expect(markdown).not.toContain("not covered");
   });
 
+  it("is an ERROR when a hunk is larger than the chunk limit (F2)", () => {
+    const repo = makeRepo("oversize-");
+    const added = Array.from({ length: 40 }, (_, index) => `+const value${index} = ${index};`).join("\n");
+    const diff = `${fileSection("src/feature.js", [`@@ -0,0 +1,40 @@\n${added}`])}\n`;
+    const result = review({
+      diff,
+      base: "main",
+      rules: defaultRules(),
+      outDir: join(repo, ".diff-review"),
+      blocking: true,
+      workdir: repo,
+      maxChars: 150,
+    });
+    // The worker says PASS, but its single chunk was too big to have been read whole.
+    expect(result.parsed).toMatchObject({ ok: true, verdict: "PASS" });
+    expect(result.decision.exitCode).toBe(1);
+    expect(result.decision.line).toContain("ERROR");
+  });
+
   it("finishes a --diff-file review with the repo as the worker cwd", () => {
     const repo = makeRepo("cli-");
     execFileSync("git", ["branch", "origin/main", "main"], { cwd: repo });
