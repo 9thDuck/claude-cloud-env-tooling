@@ -235,11 +235,11 @@ describe("CLI", () => {
     expect(result.stderr + result.stdout).toContain("DIFF_REVIEW_CHUNK_CHARS=1 is not an integer of at least 5000");
   });
 });
+
 // A --base that already contains HEAD (--base HEAD, or a branch ahead of HEAD)
 // makes the collected diff empty. In blocking mode that must not turn the gate
 // green with nothing reviewed: review() fails closed on zero chunks, so main()
 // must let the empty diff reach it.
-// empty diff reach it.
 describe("CLI: an empty diff in blocking mode", () => {
   it("is an ERROR with a verdict.md, not exit 0", () => {
     const repo = makeRepo("empty-blocking-");
