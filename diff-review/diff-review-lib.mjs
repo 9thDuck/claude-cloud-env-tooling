@@ -28,14 +28,37 @@ export const MAX_DIFF_CHARS = 200000;
 export const DIFF_REVIEW_CHUNK_CHARS = 20000;
 
 /**
- * The chunk size: a positive integer DIFF_REVIEW_CHUNK_CHARS, else 20000.
+ * The smallest chunk DIFF_REVIEW_CHUNK_CHARS may ask for. Below it every file
+ * becomes its own worker run (DIFF_REVIEW_CHUNK_CHARS=1 would start one per
+ * hunk), which multiplies the quota spend for no extra coverage.
+ */
+export const DIFF_REVIEW_CHUNK_CHARS_MIN = 5000;
+
+/**
+ * The chunk size: DIFF_REVIEW_CHUNK_CHARS when it is valid (see
+ * chunkCharsError), else 20000. The CLI refuses an invalid value before any
+ * worker runs, so the fallback is only reached by a value it already rejected.
  * @param {Record<string, string | undefined>} env
  * @returns {number}
  */
 export function chunkCharsFromEnv(env = process.env) {
+  if (chunkCharsError(env) !== null) return DIFF_REVIEW_CHUNK_CHARS;
   const raw = env.DIFF_REVIEW_CHUNK_CHARS;
-  if (typeof raw === "string" && /^[1-9]\d*$/.test(raw)) return Number(raw);
-  return DIFF_REVIEW_CHUNK_CHARS;
+  return typeof raw === "string" && raw !== "" ? Number(raw) : DIFF_REVIEW_CHUNK_CHARS;
+}
+
+/**
+ * Why DIFF_REVIEW_CHUNK_CHARS cannot be used, or null when it is unset or valid.
+ * A set value must be an integer of at least DIFF_REVIEW_CHUNK_CHARS_MIN.
+ * @param {Record<string, string | undefined>} env
+ * @returns {string | null}
+ */
+export function chunkCharsError(env = process.env) {
+  const raw = env.DIFF_REVIEW_CHUNK_CHARS;
+  if (raw === undefined || raw === "") return null;
+  if (!/^[1-9]\d*$/.test(raw) || Number(raw) < DIFF_REVIEW_CHUNK_CHARS_MIN)
+    return `DIFF_REVIEW_CHUNK_CHARS=${raw} is not an integer of at least ${DIFF_REVIEW_CHUNK_CHARS_MIN}; unset it for the ${DIFF_REVIEW_CHUNK_CHARS} default`;
+  return null;
 }
 
 /** Worker timeout: a base plus a step for every WORKER_TIMEOUT_STEP_CHARS. */
@@ -44,25 +67,35 @@ export const WORKER_TIMEOUT_STEP_SECONDS = 600;
 export const WORKER_TIMEOUT_STEP_CHARS = 50000;
 export const WORKER_TIMEOUT_MAX_SECONDS = 3600;
 
+/** Seconds allowed per turn of the turn cap, so the cap is reached before the timeout. */
+export const WORKER_TIMEOUT_SECONDS_PER_TURN = 30;
+/** The turn-derived timeout never exceeds this, whatever DIFF_REVIEW_MAX_TURNS says. */
+export const WORKER_TIMEOUT_TURN_MAX_SECONDS = 7200;
+
 /**
- * Seconds to give the worker for a chunk of `chars` characters: 600s base plus
- * 600s per started 50,000 characters, capped at 3600s. A larger chunk is read
- * with more of the repository, so a fixed timeout would cut it off. An explicit
- * DIFF_REVIEW_TIMEOUT_SECONDS (a positive integer) wins over both the formula
- * and the cap.
+ * Seconds to give the worker for a chunk of `chars` characters: the larger of
+ * the size formula (600s base plus 600s per started 50,000 characters, capped
+ * at 3600s) and 30s for every turn of the chunk's turn cap (capped at 7200s).
+ * A larger chunk is read with more of the repository, and a raised turn cap
+ * must not be cut off by a timeout sized for the old one: a timeout is not
+ * retried, so a run that times out is spent quota with no verdict. An explicit
+ * DIFF_REVIEW_TIMEOUT_SECONDS (a positive integer) wins over both.
  * @param {number} chars chunk size in characters.
  * @param {Record<string, string | undefined>} env
+ * @param {number} maxTurns the chunk's turn cap (maxTurnsFor).
  * @returns {number} timeout in seconds.
  */
-export function workerTimeoutSeconds(chars, env = process.env) {
+export function workerTimeoutSeconds(chars, env = process.env, maxTurns = maxTurnsFor(chars, env)) {
   const override = env.DIFF_REVIEW_TIMEOUT_SECONDS;
   if (typeof override === "string" && /^[1-9]\d*$/.test(override)) return Number(override);
   const size = Number.isFinite(chars) && chars > 0 ? chars : 0;
   const steps = Math.ceil(size / WORKER_TIMEOUT_STEP_CHARS);
-  return Math.min(
+  const bySize = Math.min(
     WORKER_TIMEOUT_MAX_SECONDS,
     WORKER_TIMEOUT_BASE_SECONDS + steps * WORKER_TIMEOUT_STEP_SECONDS,
   );
+  const byTurns = Math.min(WORKER_TIMEOUT_TURN_MAX_SECONDS, maxTurns * WORKER_TIMEOUT_SECONDS_PER_TURN);
+  return Math.max(bySize, byTurns);
 }
 
 /** Chunk workers in flight when DIFF_REVIEW_CONCURRENCY is not set. */
@@ -671,7 +704,7 @@ export const DECIDED_COPY = "./decided.md";
 
 /**
  * The task the reviewer is given.
- * @param {{ base: string, rules?: string[], decided?: boolean, project?: string | null, chunk?: { text: string, files: string[] }, chunkIndex?: number, chunkCount?: number, diffPath?: string, verdictPath?: string, rulePaths?: string[], decidedPath?: string | null, workdir?: string, delta?: { since: string, path: string, result: string } | null }} options
+ * @param {{ base: string, rules?: string[], decided?: boolean, project?: string | null, chunk?: { text: string, files: string[] }, chunkIndex?: number, chunkCount?: number, diffPath?: string, verdictPath?: string, rulePaths?: string[], decidedPath?: string | null, workdir?: string, readRoot?: string | null, delta?: { since: string, path: string, result: string } | null }} options
  *   `chunk` is this run's complete patch; `diffPath`, `verdictPath` and
  *   `rulePaths` are absolute paths (the worker's cwd is the repository root, not
  *   the run directory). `rules` names the rule files when `rulePaths` is absent.
@@ -690,7 +723,8 @@ export function buildPrompt({
   verdictPath = "./verdict.json",
   rulePaths = null,
   decidedPath = null,
-  workdir = "the repository root",
+  workdir = "the run directory",
+  readRoot = null,
   delta = null,
 }) {
   const text = typeof chunk.text === "string" ? chunk.text : "";
@@ -716,7 +750,9 @@ export function buildPrompt({
       ? ["This chunk covers these files:", ...files.map((file) => `- ${file}`)]
       : ["This chunk holds no file body."]),
     "",
-    `Your working directory is ${workdir}, the repository root. Read the repository with Read, Grep, Glob and git show/log/diff/blame/rev-parse/ls-files; that is where you verify what the diff claims. Treat the repository as read-only: do not edit, create or delete anything in it. The only files you may write are ${verdictPath} and the progress file named in your WORKER RULES.`,
+    readRoot === null
+      ? `Your working directory is ${workdir}. There is no repository to read for this review; judge the diff and the rule files. The only files you may write are ${verdictPath} and the progress file named in your WORKER RULES.`
+      : `Your working directory is ${workdir}, this review's run directory. The repository is at ${readRoot}: read it with Read, Grep and Glob on absolute paths under ${readRoot}, and with plain git show/log/diff/blame/rev-parse/ls-files run from your working directory, which is inside the repository (git -C is refused); that is where you verify what the diff claims. The repository is read-only for you: any edit there is refused. The only files you may write are ${verdictPath} and the progress file named in your WORKER RULES.`,
     "",
     "Read these rule files yourself before judging; do not rely on memory or on this prompt:",
     ...copies.map((copy) => `- ${copy}`),

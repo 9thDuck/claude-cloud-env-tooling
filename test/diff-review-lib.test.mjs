@@ -11,7 +11,9 @@ import {
   fileRank,
   filesInDiff,
   maxTurnsFor,
+  chunkCharsError,
   chunkCharsFromEnv,
+  DIFF_REVIEW_CHUNK_CHARS_MIN,
   mergeVerdicts,
   noRetry429FromEnv,
   parseConfig,
@@ -119,7 +121,8 @@ describe("buildPrompt", () => {
       verdictPath: "/runs/1/chunks/2/verdict.json",
       rulePaths: ["/runs/1/rules/1-a.md", "/runs/1/rules/2-rules.md"],
       project: "A shop",
-      workdir: "/repo",
+      workdir: "/runs/1/chunks/2",
+      readRoot: "/repo",
     });
     expect(prompt).toContain("- /runs/1/rules/1-a.md");
     expect(prompt).toContain("- /runs/1/rules/2-rules.md");
@@ -127,7 +130,10 @@ describe("buildPrompt", () => {
     expect(prompt).toContain("chunk 2 of 3");
     expect(prompt).toContain("/runs/1/chunks/2/diff.patch");
     expect(prompt).toContain("/runs/1/chunks/2/verdict.json");
-    expect(prompt).toContain("Your working directory is /repo");
+    expect(prompt).toContain("Your working directory is /runs/1/chunks/2");
+    expect(prompt).toContain("The repository is at /repo");
+    expect(prompt).toContain("plain git show");
+    expect(prompt).toContain("git -C is refused");
     expect(prompt).toContain("- src/a.js");
     expect(prompt).toContain("- e2e/a.js");
     expect(prompt).not.toContain("decided");
@@ -289,15 +295,29 @@ describe("DIFF_REVIEW_CHUNK_CHARS", () => {
 
 describe("workerTimeoutSeconds", () => {
   it("scales 600s base by 600s per started 50,000 characters", () => {
-    expect(workerTimeoutSeconds(0, {})).toBe(600);
-    expect(workerTimeoutSeconds(1, {})).toBe(1200);
-    expect(workerTimeoutSeconds(50000, {})).toBe(1200);
-    expect(workerTimeoutSeconds(50001, {})).toBe(1800);
-    expect(workerTimeoutSeconds(200000, {})).toBe(3000);
+    // maxTurns 1 keeps the turn-derived floor (30s) out of the way.
+    expect(workerTimeoutSeconds(0, {}, 1)).toBe(600);
+    expect(workerTimeoutSeconds(1, {}, 1)).toBe(1200);
+    expect(workerTimeoutSeconds(50000, {}, 1)).toBe(1200);
+    expect(workerTimeoutSeconds(50001, {}, 1)).toBe(1800);
+    expect(workerTimeoutSeconds(200000, {}, 1)).toBe(3000);
   });
 
-  it("caps at 3600s however large the chunk", () => {
-    expect(workerTimeoutSeconds(1000000, {})).toBe(3600);
+  it("caps the size formula at 3600s however large the chunk", () => {
+    expect(workerTimeoutSeconds(1000000, {}, 1)).toBe(3600);
+  });
+
+  it("never times out before the turn cap: 30s per turn wins when larger", () => {
+    // 20K default chunk: 50 turns = 1500s beats the 1200s size formula.
+    expect(workerTimeoutSeconds(20000, {})).toBe(1500);
+    // 52K chunk (the P1a case): 82 turns = 2460s beats 1800s.
+    expect(workerTimeoutSeconds(52000, {})).toBe(2460);
+    // A raised DIFF_REVIEW_MAX_TURNS raises the timeout with it.
+    expect(workerTimeoutSeconds(20000, { DIFF_REVIEW_MAX_TURNS: "200" })).toBe(6000);
+  });
+
+  it("caps the turn-derived timeout at 7200s", () => {
+    expect(workerTimeoutSeconds(20000, { DIFF_REVIEW_MAX_TURNS: "100000" })).toBe(7200);
   });
 
   it("lets DIFF_REVIEW_TIMEOUT_SECONDS override the formula and the cap", () => {
@@ -306,11 +326,12 @@ describe("workerTimeoutSeconds", () => {
   });
 
   it("ignores a malformed override instead of passing it to the worker", () => {
-    expect(workerTimeoutSeconds(50001, { DIFF_REVIEW_TIMEOUT_SECONDS: "0" })).toBe(1800);
-    expect(workerTimeoutSeconds(50001, { DIFF_REVIEW_TIMEOUT_SECONDS: "abc" })).toBe(1800);
-    expect(workerTimeoutSeconds(50001, { DIFF_REVIEW_TIMEOUT_SECONDS: "1.5" })).toBe(1800);
+    expect(workerTimeoutSeconds(50001, { DIFF_REVIEW_TIMEOUT_SECONDS: "0" }, 1)).toBe(1800);
+    expect(workerTimeoutSeconds(50001, { DIFF_REVIEW_TIMEOUT_SECONDS: "abc" }, 1)).toBe(1800);
+    expect(workerTimeoutSeconds(50001, { DIFF_REVIEW_TIMEOUT_SECONDS: "1.5" }, 1)).toBe(1800);
   });
 });
+
 
 describe("mergeVerdicts", () => {
   const pass = { ok: true, verdict: "PASS", findings: [], untested: [] };
@@ -575,9 +596,24 @@ describe("chunkCharsFromEnv", () => {
     expect(chunkCharsFromEnv({ DIFF_REVIEW_CHUNK_CHARS: "8000" })).toBe(8000);
   });
 
-  it("ignores a bad value", () => {
+  it("falls back only for a value chunkCharsError rejects", () => {
     expect(chunkCharsFromEnv({ DIFF_REVIEW_CHUNK_CHARS: "0" })).toBe(20000);
     expect(chunkCharsFromEnv({ DIFF_REVIEW_CHUNK_CHARS: "big" })).toBe(20000);
+    expect(chunkCharsFromEnv({ DIFF_REVIEW_CHUNK_CHARS: "1" })).toBe(20000);
+  });
+});
+
+describe("chunkCharsError", () => {
+  it("accepts unset and any integer from the minimum up", () => {
+    expect(chunkCharsError({})).toBeNull();
+    expect(chunkCharsError({ DIFF_REVIEW_CHUNK_CHARS: "" })).toBeNull();
+    expect(chunkCharsError({ DIFF_REVIEW_CHUNK_CHARS: String(DIFF_REVIEW_CHUNK_CHARS_MIN) })).toBeNull();
+    expect(chunkCharsError({ DIFF_REVIEW_CHUNK_CHARS: "52000" })).toBeNull();
+  });
+
+  it("rejects 1, anything under the minimum and anything not an integer", () => {
+    for (const raw of ["1", "4999", "0", "-5000", "big", "8000.5"])
+      expect(chunkCharsError({ DIFF_REVIEW_CHUNK_CHARS: raw })).toContain(`DIFF_REVIEW_CHUNK_CHARS=${raw}`);
   });
 });
 
