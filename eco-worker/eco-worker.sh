@@ -131,7 +131,8 @@ finish() {
   [ -n "$res" ] && pd=$(printf '%s' "$res" | jq '.permission_denials | length')
   # The result usually lists hook refusals too, so take the larger count rather than the sum when there is one.
   hd=$(hcount)  # the log is emptied at leg start (below), so it holds only this leg
-  [ -z "$res" ] && sd=$(printf '%s\n' "$legtxt" | grep -c -e 'This command requires approval' -e 'Permission to use [A-Za-z]* with command .* has been denied')
+  # Only an is_error tool_result is a refusal; a file the worker read can quote these phrases.
+  [ -z "$res" ] && sd=$(printf '%s\n' "$legtxt" | jq -R 'fromjson? | select(type == "object" and .type == "user") | .message.content[]? | select(type == "object" and .type == "tool_result" and .is_error == true) | (.content | if type == "array" then map(.text? // "") | join(" ") else tostring end) | select(test("This command requires approval|Permission to use [A-Za-z]* with command .* has been denied"))' | grep -c .)
   if [ -n "$res" ]; then denied=$(( pd > hd ? pd : hd )); else denied=$((hd + sd)); fi
   if [ "$denied" -gt 0 ]; then
     # Deny beats allow, so -a cannot lift a refusal a deny rule or the hook caused; mark those.
