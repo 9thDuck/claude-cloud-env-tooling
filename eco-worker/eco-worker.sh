@@ -3,7 +3,9 @@
 # spend the main model's quota. See README.md for setup and every environment variable.
 # Default timeout 1800 s; override with ECO_WORKER_TIMEOUT_S or -t. A leg with no log output for ECO_WORKER_STALL_S (600) s is killed.
 # ECO_WORKER_NO_RETRY_429=1 ends the leg at the first API 429 (diff-review sets this by default);
-# ECO_WORKER_MAX_TURNS=N kills the leg after more than N assistant turns and reports error_max_turns.
+# ECO_WORKER_MAX_TURNS=N kills the leg after more than N tool calls and reports error_max_turns. A turn is a tool call:
+# thinking and text blocks are stream events of their own and never count (ay7h3). With a cap set, a PostToolUse hook
+# (turn-warn-hook.sh) tells the worker to write its result once ECO_WORKER_TURN_WARN_LEFT (5) calls or fewer remain.
 # Both are reported on the RESULT line so a caller can tell a rate limit or a turn cap from a plain error.
 # Usage: eco-worker [-m model-id] [-t secs] [-d dir] [-b] [-a rule]... "<task>"
 #        eco-worker -r <run> [-t secs] [-d dir] [-b] [-a rule]... "<answers or path to answers file>"
@@ -43,6 +45,7 @@ shift $((OPTIND-1)); task="${1:-}"
 [ -n "${ECO_WORKER_API_KEY:-}" ] || { echo "eco-worker: FAILED ECO_WORKER_API_KEY not set (the API key for $base_url)" >&2; exit 2; }
 case "$timeout_s" in ''|*[!0-9]*) echo "eco-worker: FAILED -t needs whole seconds" >&2; exit 2;; esac
 case "${ECO_WORKER_STALL_S:-600}" in ''|*[!0-9]*) echo "eco-worker: FAILED ECO_WORKER_STALL_S needs whole seconds" >&2; exit 2;; esac
+case "${ECO_WORKER_TURN_WARN_LEFT:-5}" in *[!0-9]*|'') echo "eco-worker: FAILED ECO_WORKER_TURN_WARN_LEFT needs a whole number" >&2; exit 2;; *) warn_left="${ECO_WORKER_TURN_WARN_LEFT:-5}";; esac
 case "${ECO_WORKER_MAX_TURNS:-}" in '' ) max_turns="";; *[!0-9]*|0) echo "eco-worker: FAILED ECO_WORKER_MAX_TURNS needs a positive whole number" >&2; exit 2;; *) max_turns="$ECO_WORKER_MAX_TURNS";; esac
 no_retry_429=0; [ "${ECO_WORKER_NO_RETRY_429:-0}" = 1 ] && no_retry_429=1
 case "$model" in ''|*[[:space:]]*) echo "eco-worker: FAILED bad model id '$model'" >&2; exit 2;; esac
@@ -128,7 +131,8 @@ finish() {
   [ -n "$res" ] && pd=$(printf '%s' "$res" | jq '.permission_denials | length')
   # The result usually lists hook refusals too, so take the larger count rather than the sum when there is one.
   hd=$(hcount)  # the log is emptied at leg start (below), so it holds only this leg
-  [ -z "$res" ] && sd=$(printf '%s\n' "$legtxt" | grep -c -e 'This command requires approval' -e 'Permission to use [A-Za-z]* with command .* has been denied')
+  # A refusal is an is_error tool_result that starts with the refusal text; a file the worker read can quote it anywhere.
+  [ -z "$res" ] && sd=$(printf '%s\n' "$legtxt" | jq -R 'fromjson? | select(type == "object" and .type == "user") | .message.content[]? | select(type == "object" and .type == "tool_result" and .is_error == true) | (.content | if type == "array" then map(.text? // "") | join(" ") else tostring end) | select(test("^(This command requires approval|Permission to use [A-Za-z]* with command .* has been denied)"))' | grep -c .)
   if [ -n "$res" ]; then denied=$(( pd > hd ? pd : hd )); else denied=$((hd + sd)); fi
   if [ "$denied" -gt 0 ]; then
     # Deny beats allow, so -a cannot lift a refusal a deny rule or the hook caused; mark those.
@@ -186,7 +190,14 @@ git -C "$workdir" rev-parse --git-dir >> "$logdir/$run.pre.err" 2>&1 && git -C "
 [ -x "$hook" ] || { echo "eco-worker: FAILED $hook missing or not executable" | tee -a "$log" >&2; exit 2; }
 : > "$hlog"; : > "$hlog.json"
 # ECO_WORKER_ALLOW_HOOK: an extra PreToolUse command that may answer "allow" (diff-review's read-only hook); the deny hook still runs and a refusal wins.
-jq -n --arg h "$hook" --arg a "${ECO_WORKER_ALLOW_HOOK:-}" '{attribution: false, hooks: {PreToolUse: [{matcher: "Bash", hooks: ([{type: "command", command: $h}] + (if $a == "" then [] else [{type: "command", command: $a}] end))}]}}' > "$cfg/settings.json"
+# With a turn cap, turn-warn-hook.sh counts this leg's tool calls and warns the worker near the cap (ay7h3).
+warncmd=""
+if [ -n "$max_turns" ]; then
+  : > "$logdir/$run.calls"
+  printf '%s\n' "Write your result files now (for a review, verdict.json as valid JSON) with what you have verified, and list what you could not check under untested. Do not start new reads." > "$cfg/turn-warn.txt"
+  warncmd="$(printf '%q ' "$(dirname "$(readlink -f "$0")")/turn-warn-hook.sh" "$logdir/$run.calls" "$max_turns" "$warn_left" "$cfg/turn-warn.txt")"
+fi
+jq -n --arg h "$hook" --arg a "${ECO_WORKER_ALLOW_HOOK:-}" --arg w "$warncmd" '{attribution: false, hooks: ({PreToolUse: [{matcher: "Bash", hooks: ([{type: "command", command: $h}] + (if $a == "" then [] else [{type: "command", command: $a}] end))}]} + (if $w == "" then {} else {PostToolUse: [{matcher: "", hooks: [{type: "command", command: $w}]}]} end))}' > "$cfg/settings.json"
 xa="$(printf '%s\n' "${extra[@]}" | jq -R 'select(length>0)' | jq -s .)"
 jq --argjson xa "$xa" '.permissions.allow += $xa' "$perms" > "$cfg/permissions.json" || { echo "eco-worker: FAILED cannot build $cfg/permissions.json" | tee -a "$log" >&2; exit 2; }
 gsrc0="$(guard src)"; guard0="$(guard)"  # after $cfg is built, so the leg's own -a rules are the baseline
@@ -235,9 +246,11 @@ while [ -d "/proc/$cpid" ]; do
   # Only reportable lines count, so a tool_result echoing "api_error_status":429 does not kill a healthy run.
   rt="$(reportable "$lt")"
   if [ "$no_retry_429" = 1 ] && { [[ "$rt" == *'"error_status":429'* || "$rt" == *'"error_status": 429'* || "$rt" == *'"api_error_status":429'* || "$rt" == *'"api_error_status": 429'* || "$rt" == *'"rate_limit_error"'* ]]; }; then err429=1; echo "eco-worker: RATE LIMITED (429) no retry, ending run $run" | tee -a "$log" >&2; kill "$cpid"; break; fi
-  # Turn cap: count assistant turns in this leg; going past the cap ends the leg.
+  # Turn cap: count this leg's tool calls (tool_use blocks in assistant events); going past the cap ends the leg.
+  # Each thinking or text block is an assistant event of its own, so counting events voided reviews early (ay7h3).
+  # A quote inside a JSON string is escaped, so the literal only matches a real block.
   if [ -n "$max_turns" ]; then
-    turns="$(printf '%s\n' "$lt" | grep -c '"type":"assistant"' || true)"
+    turns="$(printf '%s\n' "$lt" | awk '/"type":"assistant"/ { n += gsub(/"type":"tool_use"/, "") } END { print n + 0 }')"
     if [ "${turns:-0}" -gt "$max_turns" ]; then turncap=1; echo "eco-worker: TURN CAP $max_turns reached, ending run $run" | tee -a "$log" >&2; kill "$cpid"; break; fi
   fi
   # Stall watchdog: a log with no new line for $stall_s seconds means a hung call; end the run loudly.

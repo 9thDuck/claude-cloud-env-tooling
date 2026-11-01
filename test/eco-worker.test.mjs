@@ -190,7 +190,8 @@ describe("eco-worker.sh", () => {
   });
 
   it("ends the leg past ECO_WORKER_MAX_TURNS and reports error_max_turns", () => {
-    const turns = `for i in 1 2 3 4 5; do printf '%s\\n' '{"type":"assistant","message":{}}'; done`;
+    const call = '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t","name":"Read","input":{}}]}}';
+    const turns = `for i in 1 2 3 4 5; do printf '%s\\n' '${call}'; done`;
     const { root, workdir, env } = fakeClaude(`${turns}\nsleep 30`);
     try {
       const result = spawnSync(tool("eco-worker.sh"), ["-t", "20", "-d", workdir, "do a thing"], {
@@ -203,6 +204,104 @@ describe("eco-worker.sh", () => {
       expect(status).toContain("error_max_turns(turn-cap)");
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // ay7h3: a capped leg of a real review reported denied=1 because a Read result
+  // quoted eco-worker.sh's own refusal pattern. Only an is_error tool_result is a refusal.
+  const quoted = "134\\t  sd=$(grep -c -e \"This command requires approval\" log)";
+  for (const [label, block, denied] of [
+    ["a Read result with no is_error quoting a refusal", { content: quoted }, "denied=0"],
+    ["an error result that quotes a refusal mid-text", { is_error: true, content: `grep: ${quoted}` }, "denied=0"],
+    ["a real refusal", { is_error: true, content: "This command requires approval" }, "denied=1"],
+  ]) {
+    it(`counts ${denied} for ${label} in a leg with no result (ay7h3)`, () => {
+      const event = JSON.stringify({
+        type: "user",
+        message: { content: [{ type: "tool_result", tool_use_id: "t", ...block }] },
+      });
+      const { root, workdir, env } = fakeClaude(`printf '%s\\n' '${event}'\nexit 1`);
+      try {
+        spawnSync(tool("eco-worker.sh"), ["-t", "20", "-d", workdir, "do a thing"], { encoding: "utf8", env });
+        expect(statusText(root)).toContain(denied);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  // ay7h3: chunk 7 of a real review was voided at "turn" 50 of 49 after only 31 tool
+  // calls; each thinking and text block is its own assistant event. The cap counts
+  // tool calls, so the real stream, replayed, ends with a verdict and RESULT=ok.
+  it("counts tool calls, not assistant events: the real chunk 7 stream finishes under cap 49 (ay7h3)", () => {
+    const fixture = resolve(import.meta.dirname, "fixtures", "chunk7-assistant-stream.jsonl");
+    const { root, workdir, env } = fakeClaude(
+      `cat '${fixture}'\nsleep 4\nprintf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > verdict.json\nprintf '%s\\n' '{"type":"result","is_error":false,"result":"done","permission_denials":[]}'`,
+    );
+    try {
+      const result = spawnSync(tool("eco-worker.sh"), ["-t", "30", "-d", workdir, "review"], {
+        encoding: "utf8",
+        env: { ...env, ECO_WORKER_MAX_TURNS: "49" },
+      });
+      const status = statusText(root);
+      expect(status).toContain("RESULT=ok");
+      expect(status).not.toContain("turn-cap");
+      expect(result.status).toBe(0);
+      expect(JSON.parse(readFileSync(join(workdir, "verdict.json"), "utf8")).verdict).toBe("PASS");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("registers the near-cap warning hook only when ECO_WORKER_MAX_TURNS is set (ay7h3)", () => {
+    const { root, workdir, env } = fakeClaude(
+      `while [ "$1" != --settings ]; do shift; done; printf '%s' "$2" > "${"$"}{ECO_TEST_SETTINGS}"; exit 0`,
+    );
+    try {
+      const postHooks = (extra) => {
+        const out = join(root, "settings.json");
+        spawnSync(tool("eco-worker.sh"), ["-t", "20", "-d", workdir, "do a thing"], {
+          encoding: "utf8",
+          env: { ...env, ECO_TEST_SETTINGS: out, ECO_WORKER_FORWARD_ENV: "ECO_TEST_SETTINGS", ...extra },
+        });
+        const post = JSON.parse(readFileSync(out, "utf8")).hooks.PostToolUse;
+        return post === undefined ? [] : post[0].hooks.map((h) => h.command);
+      };
+      const capped = postHooks({ ECO_WORKER_MAX_TURNS: "10" });
+      expect(capped).toHaveLength(1);
+      expect(capped[0]).toContain(tool("turn-warn-hook.sh"));
+      expect(postHooks({})).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("warns the worker from ECO_WORKER_TURN_WARN_LEFT calls before the cap, not earlier (ay7h3)", () => {
+    mkdirSync(WORK, { recursive: true });
+    const dir = mkdtempSync(join(WORK, "turn-warn-"));
+    try {
+      const counter = join(dir, "calls");
+      const message = join(dir, "warn.txt");
+      writeFileSync(message, "write verdict.json now");
+      const outputs = [];
+      for (let call = 1; call <= 4; call += 1) {
+        const run = spawnSync(tool("turn-warn-hook.sh"), [counter, "5", "2", message], {
+          encoding: "utf8",
+          input: '{"hook_event_name":"PostToolUse","tool_name":"Read"}',
+        });
+        expect(run.status).toBe(0);
+        outputs.push(run.stdout);
+      }
+      // Cap 5, warn with 2 left: calls 1 and 2 are quiet, call 3 leaves 2.
+      expect(outputs[0]).toBe("");
+      expect(outputs[1]).toBe("");
+      const warned = JSON.parse(outputs[2]);
+      expect(warned.hookSpecificOutput.hookEventName).toBe("PostToolUse");
+      expect(warned.hookSpecificOutput.additionalContext).toContain("write verdict.json now");
+      expect(warned.hookSpecificOutput.additionalContext).toContain("2 tool calls left");
+      expect(JSON.parse(outputs[3]).hookSpecificOutput.additionalContext).toContain("1 tool call left");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

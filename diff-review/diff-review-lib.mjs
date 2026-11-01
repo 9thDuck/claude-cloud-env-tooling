@@ -929,6 +929,7 @@ export function buildPrompt({
     `- Every finding must carry \`rule\`: a short quote of the rule text it violates, copied from one of the rule files${decided ? " (not the decided-items file)" : ""}, with that file's name. A finding without a quoted rule is not a finding.`,
     "- Style nits are not findings unless a rule file states the rule. Do not invent rules.",
     "- List anything you could not check (unread code, a claim you cannot verify) under `untested`; an empty list is allowed only when you checked everything.",
+    "- You have no web access: do not call WebFetch or WebSearch, since a refused call makes the review an ERROR; a claim that rests on external documentation goes under `untested` and never counts as checked on its own.",
     "",
     `When you are done, write your verdict to ${verdictPath}, exactly this shape and nothing else:`,
     '{"verdict":"PASS"|"FAIL","findings":[{"file":"<repo-relative path>","line":<number or null>,"rule":"<quoted rule>","why":"<what the diff does and which rule it breaks>"}],"untested":["<what you could not check>"]}',
