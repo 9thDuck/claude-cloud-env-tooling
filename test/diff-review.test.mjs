@@ -1196,6 +1196,26 @@ describe("review: quota guards", () => {
     expect(Number(readFileSync(join(chunk, "repair-max-turns"), "utf8"))).toBeLessThanOrEqual(5);
   });
 
+  it("does not accept a repair turn that exits non-zero or hits a 429, even with a valid file (ay7h3)", async () => {
+    process.env.DIFF_REVIEW_WORKER = script(
+      "repair-429.sh",
+      repairWorker(`printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
+  printf '%s\\n' '{"type":"system","subtype":"api_retry","error_status":429,"error":{"type":"rate_limit_error","message":"repair slow down"}}' > "$out/repair.log"
+  exit 1`),
+    );
+    const repo = makeRepo("repair-429-");
+    const result = await review({
+      diff: `${fileSection("src/good.js")}\n`,
+      base: "main",
+      rules: defaultRules(),
+      outDir: join(repo, ".diff-review"),
+      blocking: false,
+      readRoot: repo,
+    });
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toContain("rate limited (429)");
+  });
+
   it("makes a verdict.json still invalid after the repair turn an ERROR, unpatched (ay7h3)", async () => {
     process.env.DIFF_REVIEW_WORKER = script("repair-bad.sh", repairWorker(`cp '${BAD_VERDICT}' "$out/verdict.json"`));
     const repo = makeRepo("repair-bad-");
