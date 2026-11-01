@@ -209,14 +209,16 @@ describe("eco-worker.sh", () => {
 
   // ay7h3: a capped leg of a real review reported denied=1 because a Read result
   // quoted eco-worker.sh's own refusal pattern. Only an is_error tool_result is a refusal.
-  for (const [label, isError, denied] of [
-    ["file content quoting a refusal", false, "denied=0"],
-    ["a real refusal", true, "denied=1"],
+  const quoted = "134\\t  sd=$(grep -c -e \"This command requires approval\" log)";
+  for (const [label, block, denied] of [
+    ["a Read result with no is_error quoting a refusal", { content: quoted }, "denied=0"],
+    ["an error result that quotes a refusal mid-text", { is_error: true, content: `grep: ${quoted}` }, "denied=0"],
+    ["a real refusal", { is_error: true, content: "This command requires approval" }, "denied=1"],
   ]) {
     it(`counts ${denied} for ${label} in a leg with no result (ay7h3)`, () => {
       const event = JSON.stringify({
         type: "user",
-        message: { content: [{ type: "tool_result", tool_use_id: "t", is_error: isError, content: "This command requires approval" }] },
+        message: { content: [{ type: "tool_result", tool_use_id: "t", ...block }] },
       });
       const { root, workdir, env } = fakeClaude(`printf '%s\\n' '${event}'\nexit 1`);
       try {
