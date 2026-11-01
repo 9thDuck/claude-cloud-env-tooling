@@ -17,7 +17,7 @@ import { isAbsolute, resolve } from "node:path";
 
 /** Commands that only read, whatever their arguments, except as checked below. */
 const READ_ONLY = new Set([
-  "cat", "head", "tail", "wc", "ls", "grep", "egrep", "fgrep", "rg", "jq", "cut", "sort",
+  "cat", "head", "tail", "wc", "ls", "grep", "egrep", "fgrep", "rg", "jq", "cut",
   "uniq", "tr", "diff", "cmp", "comm", "stat", "sha256sum", "sha1sum", "md5sum",
   "pwd", "basename", "dirname", "realpath", "readlink", "nl", "tac", "rev", "column",
   "fold", "od", "expand", "echo", "printf", "true", "find", "sed", "git",
@@ -139,8 +139,6 @@ function why(w, o) {
     }
     case "find":
       return flag(/^-(exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)$/) ? "find that runs or writes" : "";
-    case "sort":
-      return flag(/^(-o|--output|-[a-z]*o|--compress-program|--temporary-directory|-T)/) ? "sort flag that writes or runs a program" : "";
     case "rg":
       return flag(/^--pre/) ? "rg --pre runs a program" : "";
     case "git":

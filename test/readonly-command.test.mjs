@@ -78,6 +78,9 @@ describe("isReadOnlyCommand: refusals replayed (67njw)", () => {
     "cat /repo/a; rm /repo/a",
     "cat /repo/a > out.txt; git checkout -- a",
     "sort --compress-program=sh /repo/a",
+    "sort --out=/repo/x /repo/a",
+    "sort -nT/tmp /repo/a",
+    "git log | sort",
     "git log -p --textconv",
     "xxd -r /repo/a out.bin",
     "file -C -m magic",
@@ -102,6 +105,15 @@ describe("readonly-hook.mjs", () => {
 
   it("gives no decision for a write, so the normal rules refuse it", () => {
     const r = run("git checkout --detach 25e13a7e");
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe("");
+  });
+
+  it("gives no decision when the hook input has no cwd", () => {
+    const r = spawnSync(process.execPath, [hook, "--read", READ, "--write", WRITE], {
+      input: JSON.stringify({ tool_name: "Bash", tool_input: { command: "git status" } }),
+      encoding: "utf8",
+    });
     expect(r.status).toBe(0);
     expect(r.stdout).toBe("");
   });
