@@ -412,6 +412,58 @@ export function readOnlyHookCommand(readRoot, workdir) {
   return [process.execPath, join(TOOL_DIR, "readonly-hook.mjs"), "--read", readRoot, "--write", workdir].map(q).join(" ");
 }
 
+/** Turn cap for the one repair leg: rewrite one file, nothing else (ay7h3). */
+const REPAIR_MAX_TURNS = 5;
+
+/**
+ * The run id of the newest eco-worker leg in `logDir` (its newest *.status),
+ * so a repair leg resumes the reviewer's own session; null when none is left.
+ * @param {string} logDir
+ * @returns {string | null}
+ */
+function newestRunId(logDir) {
+  const newest = readdirSync(logDir)
+    .filter((name) => name.endsWith(".status"))
+    .map((name) => ({ name, mtime: statSync(join(logDir, name)).mtimeMs }))
+    .sort((left, right) => right.mtime - left.mtime || (left.name < right.name ? 1 : -1))[0];
+  return newest === undefined ? null : newest.name.slice(0, -".status".length);
+}
+
+/**
+ * One repair leg for a verdict.json that exists but does not parse (ay7h3).
+ * The reviewer's session is resumed with the parse error and asked to rewrite
+ * the file as valid JSON; the tool never edits the file itself. Still invalid,
+ * or no leg to resume, is an ERROR.
+ * @param {{ worker: string, workdir: string, logDir: string, verdictPath: string, parseError: string, timeoutSeconds: number, env: Record<string, string | undefined>, signal?: AbortSignal }} options
+ * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
+ */
+async function repairVerdict({ worker, workdir, logDir, verdictPath, parseError, timeoutSeconds, env, signal }) {
+  let runId;
+  try {
+    runId = newestRunId(logDir);
+  } catch (error) {
+    return { ok: false, error: `could not find the reviewer's run to repair its verdict.json in ${logDir}: ${error.message}` };
+  }
+  if (runId === null)
+    return { ok: false, error: `${parseError}; no reviewer run in ${logDir} to resume for a repair turn` };
+  console.log(`[diff-review] verdict.json is invalid; one repair turn for run ${runId}`);
+  const prompt = `Your ${verdictPath} is not valid, so the review cannot be read. The parser said: ${parseError}
+Rewrite ${verdictPath} as valid JSON with the Write tool. Keep every verdict, finding and untested entry you meant; only fix the syntax. Do not read or check anything else, then stop.`;
+  const result = await spawnWorker(worker, ["-r", runId, "-t", String(timeoutSeconds), "-d", workdir, prompt], {
+    cwd: workdir,
+    stdio: "inherit",
+    signal,
+    env: { ...env, ECO_WORKER_MAX_TURNS: String(REPAIR_MAX_TURNS) },
+  });
+  if (result.error) return { ok: false, error: `${worker} could not start the repair turn: ${result.error.message}` };
+  const repaired = readVerdictFile(verdictPath);
+  if (repaired?.ok === true) return { ok: true };
+  return {
+    ok: false,
+    error: `verdict.json invalid after one repair turn: ${repaired === null ? "the file is gone" : repaired.error}`,
+  };
+}
+
 /**
  * Run the worker once, retrying once on a non-zero exit.
  *
@@ -444,7 +496,9 @@ export function readOnlyHookCommand(readRoot, workdir) {
  *
  * A 429 is never retried and is fatal for the whole review: the caller cancels
  * the other chunks. A turn-cap report is not retried either; it is an ERROR
- * unless the leg still wrote a valid verdict. Both are read from eco-worker's
+ * unless the leg still wrote a valid verdict. A leg that exits 0 or hits the
+ * cap with a verdict.json that does not parse gets one repair leg (repairVerdict).
+ * Both are read from eco-worker's
  * log/status files in `logDir`, and eco-worker runs with
  * ECO_WORKER_NO_RETRY_429=1 and ECO_WORKER_MAX_TURNS derived from the chunk size (maxTurnsFor).
  * `timeoutSeconds` scales with the chunk size and its turn cap
@@ -474,11 +528,7 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
       `[diff-review] worker attempt ${attempt}/2 (workdir ${workdir}, logs ${logDir}, timeout ${timeoutSeconds}s)`,
     );
     // `-a` rules come before `-d`; eco-worker takes the task as the last argument.
-    const result = await spawnWorker(worker, ["-t", String(timeoutSeconds), "-a", `Read(/${readRoot}/**)`, "-d", workdir, prompt], {
-      cwd: workdir,
-      stdio: "inherit",
-      signal,
-      env: {
+    const env = {
         ...process.env,
         ECO_WORKER_LOG_DIR: logDir,
         // The reviewer's read-only rule set with git -C <readRoot> twins, not the
@@ -489,7 +539,12 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
         ECO_WORKER_ALLOW_HOOK: readOnlyHookCommand(readRoot, workdir),
         ECO_WORKER_NO_RETRY_429: noRetry429 ? "1" : "0",
         ECO_WORKER_MAX_TURNS: String(maxTurns),
-      },
+    };
+    const result = await spawnWorker(worker, ["-t", String(timeoutSeconds), "-a", `Read(/${readRoot}/**)`, "-d", workdir, prompt], {
+      cwd: workdir,
+      stdio: "inherit",
+      signal,
+      env,
     });
     // Aborted because another chunk was rate limited: not an attempt worth retrying.
     if (signal?.aborted)
@@ -532,10 +587,40 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
     // Every ok path goes through this: a refusal in any attempt fails the chunk,
     // and no retry follows it.
     const okResult = (extra) => (refusal !== null ? refusal : { ok: true, retried: attempt > 1, ...extra });
-    const validVerdict = readVerdictFile(verdictPath)?.ok === true;
+    const verdictRead = readVerdictFile(verdictPath);
+    const validVerdict = verdictRead?.ok === true;
     // A clean exit with a verdict is a finished chunk; nothing else is trusted.
     if (result.status === 0 && validVerdict) return okResult({});
     const evidence = logText(logDir);
+    // A leg that finished (or hit the cap) with a verdict.json that does not
+    // parse gets one repair turn; a refused call or a 429 never does (ay7h3).
+    const capped = evidence.unreadable.length === 0 && turnCapDetail(evidence.text) !== null;
+    const repairable =
+      verdictRead !== null &&
+      verdictRead.ok !== true &&
+      refusal === null &&
+      evidence.unreadable.length === 0 &&
+      rateLimitDetail(evidence.text) === null &&
+      (result.status === 0 || capped);
+    if (repairable) {
+      const repaired = await repairVerdict({
+        worker,
+        workdir,
+        logDir,
+        verdictPath,
+        parseError: verdictRead.error,
+        timeoutSeconds,
+        env,
+        signal,
+      });
+      if (signal?.aborted)
+        return { ok: false, cancelled: true, error: "cancelled after another chunk hit the rate limit", retried: attempt > 1 };
+      if (!repaired.ok) return { ok: false, error: repaired.error, retried: attempt > 1 };
+      // The repair leg may itself have left a refused call.
+      if (readdirSync(logDir).some((name) => name.endsWith(".blocked.md")))
+        return { ok: false, blocked: true, error: "the verdict repair turn refused a call; a blocked review is not a review", retried: attempt > 1 };
+      return { ok: true, retried: attempt > 1, ...(capped ? { turnCapped: true } : {}) };
+    }
     // Unreadable evidence is a failed review, not a missing rejection: name the
     // path and error instead of retrying past a 429 nobody could read.
     if (evidence.unreadable.length > 0)
