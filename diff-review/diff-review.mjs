@@ -400,6 +400,19 @@ function spawnWorker(worker, args, options) {
 }
 
 /**
+ * The eco-worker ECO_WORKER_ALLOW_HOOK command for one chunk: readonly-hook.mjs
+ * with the repository as read root and the chunk directory as the only place a
+ * redirect may write. Each word is single-quoted for the hook's shell.
+ * @param {string} readRoot
+ * @param {string} workdir
+ * @returns {string}
+ */
+export function readOnlyHookCommand(readRoot, workdir) {
+  const q = (s) => `'${String(s).replaceAll("'", "'\\''")}'`;
+  return [process.execPath, join(TOOL_DIR, "readonly-hook.mjs"), "--read", readRoot, "--write", workdir].map(q).join(" ");
+}
+
+/**
  * Run the worker once, retrying once on a non-zero exit.
  *
  * Its logs go to `logDir` (inside the run directory) through eco-worker's
@@ -471,6 +484,9 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
         // The reviewer's read-only rule set with git -C <readRoot> twins, not the
         // builder's permissions.json.
         ECO_WORKER_PERMISSIONS: permissionsPath,
+        // Read-only commands as a class (67njw): prefix rules refused read-only
+        // pipes and redirects, and each refusal voided the review.
+        ECO_WORKER_ALLOW_HOOK: readOnlyHookCommand(readRoot, workdir),
         ECO_WORKER_NO_RETRY_429: noRetry429 ? "1" : "0",
         ECO_WORKER_MAX_TURNS: String(maxTurns),
       },

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Put eco-worker and diff-review on PATH and check what they need. Safe to run again.
+# Put eco-worker, diff-review and pw-browser-check on PATH and check what they need. Safe to run again.
 # Usage: ./install.sh [--no-key-check]   (links into ${INSTALL_BIN_DIR:-$HOME/.local/bin})
 # --no-key-check: skip the ECO_WORKER_API_KEY check, for setup scripts that run before secrets are visible.
 # Prints one PASS or FAILED line per check and exits non-zero if any check failed.
@@ -17,7 +17,7 @@ pass() { echo "PASS   $*"; }
 fail() { echo "FAILED $*"; failed=1; }
 
 mkdir -p "$bin" || { echo "FAILED cannot create $bin"; exit 1; }
-for link in "eco-worker:eco-worker/eco-worker.sh" "diff-review:diff-review/diff-review.mjs"; do
+for link in "eco-worker:eco-worker/eco-worker.sh" "diff-review:diff-review/diff-review.mjs" "pw-browser-check:browsers/pw-browser-check.mjs"; do
   name="${link%%:*}"; target="$here/${link#*:}"
   if chmod +x "$target" && ln -sfn "$target" "$bin/$name"; then pass "linked $bin/$name -> $target"; else fail "could not link $bin/$name"; fi
 done
