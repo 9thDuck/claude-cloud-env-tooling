@@ -57,8 +57,9 @@ def check(w):
         if sub == "commit" and has(rest, "", ["--amend"]): return "git commit --amend rewrites a commit"
         if sub in ("checkout","switch") and has(rest, "f", ["--force","--discard-changes"]): return "git %s with a force flag discards work" % sub
         if sub == "checkout" and "--" in rest: return "git checkout -- <path> discards work"
-        if sub in ("checkout","switch") and "--detach" in rest: return "git %s --detach moves the shared checkout" % sub
-        if sub in ("checkout","switch") and len([a for a in rest if not a.startswith("-")]) + len([a for a in rest if len(a) > 2 and a[0] == "-" and a[1] in "bcBC"]) > 1: return "git %s with a start point moves the shared checkout" % sub
+        if sub in ("checkout","switch") and has(rest, "", ["--detach"]): return "git %s --detach moves the shared checkout" % sub
+        if sub in ("checkout","switch") and len([a for a in rest if a == "-" or not a.startswith("-")]) + len([a for a in rest if len(a) > 2 and a[0] == "-" and a[1] in "bcBC"]) > 1: return "git %s with a start point moves the shared checkout" % sub
+        if sub in ("checkout","switch") and not has(rest, "bcBC", ["--create","--force-create"]) and any(a == "-" or not a.startswith("-") for a in rest): return "git %s to another branch moves the shared checkout" % sub
         if sub in ("fetch","pull","clone") and has(rest, "u", ["--upload-pack"]): return "git %s with --upload-pack runs a program" % sub
         if sub == "grep" and has(rest, "O", ["--open-files-in-pager"]): return "git grep -O runs a program"
     elif h == "rm":
