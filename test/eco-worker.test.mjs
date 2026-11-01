@@ -58,6 +58,9 @@ describe("deny-hook.sh", () => {
     "git switch -",
     "git checkout main",
     "git switch main",
+    "git switch -d",
+    "git checkout -d",
+    "git switch -qd",
     "rm -fr build",
     "gh pr list",
   ])("refuses %s", (command) => {
@@ -66,7 +69,7 @@ describe("deny-hook.sh", () => {
     expect(result.stderr).toContain("eco-worker refused this command");
   });
 
-  it.each(["git status", "git checkout -b feature", "git switch -c feature", "git commit -m 'mention --amend in text'", "rm file.txt", "ls -la"])("allows %s", (command) => {
+  it.each(["git status", "git checkout -b feature", "git switch -c feature", "git checkout -b feature-d", "git checkout -bfeature-d", "git checkout -bd", "git switch -cd", "git commit -m 'mention --amend in text'", "rm file.txt", "ls -la"])("allows %s", (command) => {
     expect(hook(command).status).toBe(0);
   });
 });
