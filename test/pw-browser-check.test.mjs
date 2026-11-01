@@ -55,6 +55,16 @@ describe("pw-browser-check.mjs (iyux9)", () => {
     expect(r.status).toBe(0);
   });
 
+  it("reads the browsers dir from PLAYWRIGHT_BROWSERS_PATH when no flag is given", () => {
+    const { repo, browsers } = fixture("1217", ["chromium-1217", "chromium_headless_shell-1217"]);
+    const r = spawnSync(process.execPath, [CHECK, repo], {
+      encoding: "utf8",
+      env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: browsers },
+    });
+    expect(r.stdout).toContain("PASS");
+    expect(r.status).toBe(0);
+  });
+
   it("fails loudly when the repo has no installed playwright", () => {
     const { browsers } = fixture("1217", []);
     const r = run(join(root, "nowhere"), browsers);
