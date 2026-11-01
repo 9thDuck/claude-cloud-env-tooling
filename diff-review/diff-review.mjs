@@ -433,11 +433,13 @@ function newestRunId(logDir) {
  * One repair leg for a verdict.json that exists but does not parse (ay7h3).
  * The reviewer's session is resumed with the parse error and asked to rewrite
  * the file as valid JSON; the tool never edits the file itself. Still invalid,
- * or no leg to resume, is an ERROR.
- * @param {{ worker: string, workdir: string, logDir: string, verdictPath: string, parseError: string, timeoutSeconds: number, env: Record<string, string | undefined>, signal?: AbortSignal }} options
+ * or no leg to resume, is an ERROR. With `finish` (the turn-cap detail), the leg
+ * was ended at the cap with no verdict.json and is asked to write it from what it
+ * has verified; still none is an ERROR.
+ * @param {{ worker: string, workdir: string, logDir: string, verdictPath: string, parseError: string, finish?: string | null, timeoutSeconds: number, env: Record<string, string | undefined>, signal?: AbortSignal }} options
  * @returns {Promise<{ ok: true } | { ok: false, error: string, rateLimited?: boolean, detail?: string }>}
  */
-async function repairVerdict({ worker, workdir, logDir, verdictPath, parseError, timeoutSeconds, env, signal }) {
+async function repairVerdict({ worker, workdir, logDir, verdictPath, parseError, timeoutSeconds, env, signal, finish = null }) {
   let runId;
   try {
     runId = newestRunId(logDir);
@@ -445,9 +447,14 @@ async function repairVerdict({ worker, workdir, logDir, verdictPath, parseError,
     return { ok: false, error: `could not find the reviewer's run to repair its verdict.json in ${logDir}: ${error.message}` };
   }
   if (runId === null)
-    return { ok: false, error: `${parseError}; no reviewer run in ${logDir} to resume for a repair turn` };
-  console.log(`[diff-review] verdict.json is invalid; one repair turn for run ${runId}`);
-  const prompt = `Your ${verdictPath} is not valid, so the review cannot be read. The parser said: ${parseError}
+    return finish === null
+      ? { ok: false, error: `${parseError}; no reviewer run in ${logDir} to resume for a repair turn` }
+      : { ok: false, turnCap: true, error: `turn cap: no verdict.json and no reviewer run in ${logDir} to resume (${finish})` };
+  console.log(`[diff-review] ${finish === null ? "verdict.json is invalid" : "turn cap reached with no verdict.json"}; one ${finish === null ? "repair" : "finish"} turn for run ${runId}`);
+  const prompt =
+    finish !== null
+      ? `The turn cap ended your review before you wrote ${verdictPath}. Write it now with the Write tool, from what you have already verified: the verdict, every finding you can back with what you read, and everything you did not get to under untested. Do not read or check anything else, then stop.`
+      : `Your ${verdictPath} is not valid, so the review cannot be read. The parser said: ${parseError}
 Rewrite ${verdictPath} as valid JSON with the Write tool. Keep every verdict, finding and untested entry you meant; only fix the syntax. Do not read or check anything else, then stop.`;
   const result = await spawnWorker(worker, ["-r", runId, "-t", String(timeoutSeconds), "-d", workdir, prompt], {
     cwd: workdir,
@@ -469,6 +476,8 @@ Rewrite ${verdictPath} as valid JSON with the Write tool. Keep every verdict, fi
     };
   const repaired = readVerdictFile(verdictPath);
   if (repaired?.ok === true) return { ok: true };
+  if (finish !== null && repaired === null)
+    return { ok: false, turnCap: true, error: `turn cap: no verdict.json after one finish turn (${finish})` };
   return {
     ok: false,
     error: `verdict.json invalid after one repair turn: ${repaired === null ? "the file is gone" : repaired.error}`,
@@ -613,13 +622,20 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
       evidence.unreadable.length === 0 &&
       rateLimitDetail(evidence.text) === null &&
       (result.status === 0 || capped);
-    if (repairable) {
+    // A leg ended at the cap with no verdict.json gets one finish turn (ay7h3).
+    const finishable =
+      verdictRead === null &&
+      capped &&
+      refusal === null &&
+      rateLimitDetail(evidence.text) === null;
+    if (repairable || finishable) {
       const repaired = await repairVerdict({
         worker,
         workdir,
         logDir,
         verdictPath,
-        parseError: verdictRead.error,
+        parseError: verdictRead?.error ?? "",
+        finish: finishable ? turnCapDetail(evidence.text) : null,
         timeoutSeconds,
         env,
         signal,
