@@ -54,6 +54,8 @@ describe("deny-hook.sh", () => {
     "git switch -c probe -",
     "git checkout -",
     "git switch -",
+    "git checkout main",
+    "git switch main",
     "rm -fr build",
     "gh pr list",
   ])("refuses %s", (command) => {
