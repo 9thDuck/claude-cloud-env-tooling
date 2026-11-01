@@ -43,6 +43,11 @@ describe("deny-hook.sh", () => {
     "git switch --detach abc123",
     "git checkout -b probe HEAD~1",
     "git switch -c probe origin/main",
+    "git checkout -bx HEAD~1",
+    "git switch -cx HEAD~1",
+    "git checkout -f -b x",
+    "git checkout -b x -f",
+    "git switch -c x --discard-changes",
     "rm -fr build",
     "gh pr list",
   ])("refuses %s", (command) => {
