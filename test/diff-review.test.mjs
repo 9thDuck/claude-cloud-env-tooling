@@ -1058,6 +1058,25 @@ fi
 printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
 `;
 
+// ay7h3: a first leg that hits the turn cap (run1.status plus the cap result line),
+// leaving the bad verdict.json or none; a -r leg records its prompt and runs $legWrites.
+function cappedWorker(firstLeavesBad, legWrites) {
+  return `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf 'x\\n' >> "$out/attempts"
+if [ "$1" = -r ]; then
+  printf '%s' "\${@: -1}" > "$out/leg-prompt"
+  printf '%s\\n' "\${ECO_WORKER_MAX_TURNS:-}" > "$out/leg-max-turns"
+  ${legWrites}
+  exit 0
+fi
+printf '%s\\n' 'eco-worker: RESULT=error exit=143 run=run1 turns=6 max_turns=5 error=error_max_turns(turn-cap)' > "$out/run1.status"
+printf '%s\\n' '{"type":"result","subtype":"error_max_turns","is_error":true}' > "$out/run1.log"
+${firstLeavesBad ? `cp '${BAD_VERDICT}' "$out/verdict.json"` : ""}
+exit 1
+`;
+}
+
 // ay7h3: the first leg writes the self-test's invalid verdict.json byte for byte; a
 // -r leg records its prompt and writes $REPAIR_WRITES (valid JSON, or the bad file again).
 const BAD_VERDICT = resolve(import.meta.dirname, "fixtures", "selftest-bad-verdict.json");
@@ -1234,6 +1253,44 @@ describe("review: quota guards", () => {
     expect(result.parsed.ok).toBe(false);
     expect(result.parsed.error).toContain("the verdict repair turn exited 1");
     expect(result.parsed.error).not.toContain("429");
+  });
+
+  it("repairs an invalid verdict.json left by a turn-capped leg (ay7h3)", async () => {
+    process.env.DIFF_REVIEW_WORKER = script(
+      "capped-bad.sh",
+      cappedWorker(true, `printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"`),
+    );
+    const repo = makeRepo("capped-bad-");
+    const result = await review({ diff: `${fileSection("src/good.js")}\n`, base: "main", rules: defaultRules(), outDir: join(repo, ".diff-review"), blocking: false, readRoot: repo });
+    expect(result.parsed.ok).toBe(true);
+    expect(attemptsIn(result, 1)).toBe(2);
+    expect(readFileSync(join(result.dir, "chunks", "1", "leg-prompt"), "utf8")).toContain("is not valid");
+  });
+
+  // ay7h3: in the cfcb880 review a reviewer got the near-cap warning, kept reading, and
+  // was ended with no verdict. One finish turn asks it to write what it has verified.
+  it("gives a turn-capped leg without a verdict one finish turn to write it (ay7h3)", async () => {
+    process.env.DIFF_REVIEW_WORKER = script(
+      "capped-none.sh",
+      cappedWorker(false, `printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":["x"]}' > "$out/verdict.json"`),
+    );
+    const repo = makeRepo("capped-none-");
+    const result = await review({ diff: `${fileSection("src/good.js")}\n`, base: "main", rules: defaultRules(), outDir: join(repo, ".diff-review"), blocking: false, readRoot: repo });
+    expect(result.parsed.ok).toBe(true);
+    expect(attemptsIn(result, 1)).toBe(2);
+    const chunk = join(result.dir, "chunks", "1");
+    expect(readFileSync(join(chunk, "leg-prompt"), "utf8")).toContain("turn cap");
+    expect(readFileSync(join(chunk, "leg-max-turns"), "utf8").trim()).toBe("5");
+  });
+
+  it("makes a turn-capped leg still without a verdict after the finish turn an ERROR (ay7h3)", async () => {
+    process.env.DIFF_REVIEW_WORKER = script("capped-none-again.sh", cappedWorker(false, ":"));
+    const repo = makeRepo("capped-none-again-");
+    const result = await review({ diff: `${fileSection("src/good.js")}\n`, base: "main", rules: defaultRules(), outDir: join(repo, ".diff-review"), blocking: false, readRoot: repo });
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toContain("turn cap");
+    expect(result.parsed.error).toContain("no verdict.json after one finish turn");
+    expect(attemptsIn(result, 1)).toBe(2);
   });
 
   it("makes a verdict.json still invalid after the repair turn an ERROR, unpatched (ay7h3)", async () => {
