@@ -185,7 +185,8 @@ mkdir -p "$cfg"
 git -C "$workdir" rev-parse --git-dir >> "$logdir/$run.pre.err" 2>&1 && git -C "$workdir" -c core.quotePath=false status --porcelain > "$logdir/$run.pre" && git -C "$workdir" rev-parse HEAD > "$logdir/$run.prehead" 2>> "$logdir/$run.pre.err"
 [ -x "$hook" ] || { echo "eco-worker: FAILED $hook missing or not executable" | tee -a "$log" >&2; exit 2; }
 : > "$hlog"; : > "$hlog.json"
-jq -n --arg h "$hook" '{attribution: false, hooks: {PreToolUse: [{matcher: "Bash", hooks: [{type: "command", command: $h}]}]}}' > "$cfg/settings.json"
+# ECO_WORKER_ALLOW_HOOK: an extra PreToolUse command that may answer "allow" (diff-review's read-only hook); the deny hook still runs and a refusal wins.
+jq -n --arg h "$hook" --arg a "${ECO_WORKER_ALLOW_HOOK:-}" '{attribution: false, hooks: {PreToolUse: [{matcher: "Bash", hooks: ([{type: "command", command: $h}] + (if $a == "" then [] else [{type: "command", command: $a}] end))}]}}' > "$cfg/settings.json"
 xa="$(printf '%s\n' "${extra[@]}" | jq -R 'select(length>0)' | jq -s .)"
 jq --argjson xa "$xa" '.permissions.allow += $xa' "$perms" > "$cfg/permissions.json" || { echo "eco-worker: FAILED cannot build $cfg/permissions.json" | tee -a "$log" >&2; exit 2; }
 gsrc0="$(guard src)"; guard0="$(guard)"  # after $cfg is built, so the leg's own -a rules are the baseline

@@ -113,6 +113,27 @@ describe("eco-worker.sh", () => {
     }
   });
 
+  it("adds ECO_WORKER_ALLOW_HOOK after the deny hook, and only when set (67njw)", () => {
+    const { root, workdir, env } = fakeClaude(
+      `while [ "$1" != --settings ]; do shift; done; printf '%s' "$2" > "${"$"}{ECO_TEST_SETTINGS}"; exit 0`,
+    );
+    try {
+      const hooksFor = (extra) => {
+        const out = join(root, "settings.json");
+        spawnSync(tool("eco-worker.sh"), ["-t", "20", "-d", workdir, "do a thing"], {
+          encoding: "utf8",
+          env: { ...env, ECO_TEST_SETTINGS: out, ECO_WORKER_FORWARD_ENV: "ECO_TEST_SETTINGS", ...extra },
+        });
+        return JSON.parse(readFileSync(out, "utf8")).hooks.PreToolUse[0].hooks.map((h) => h.command);
+      };
+      const withHook = hooksFor({ ECO_WORKER_ALLOW_HOOK: "/x/readonly-hook.mjs --read /r --write /w" });
+      expect(withHook).toEqual([tool("deny-hook.sh"), "/x/readonly-hook.mjs --read /r --write /w"]);
+      expect(hooksFor({})).toEqual([tool("deny-hook.sh")]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("ends the leg at the first 429 when ECO_WORKER_NO_RETRY_429=1", () => {
     const { root, workdir, env } = fakeClaude(
       `printf '%s\\n' '{"type":"system","subtype":"api_retry","error_status":429,"error":{"type":"rate_limit_error","message":"slow down"}}'\nsleep 30`,
