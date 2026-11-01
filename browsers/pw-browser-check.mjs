@@ -4,9 +4,11 @@
  * (bead iyux9: the image had chromium_headless_shell-1243, Playwright 1.59.1
  * wanted -1217, and nothing said so until a browser gate failed).
  * Usage: pw-browser-check.mjs <repo> [--browsers-path DIR] [--install]
- *   DIR defaults to $PLAYWRIGHT_BROWSERS_PATH, then /opt/pw-browsers.
+ *   DIR defaults to $PLAYWRIGHT_BROWSERS_PATH, then /opt/pw-browsers: the cloud
+ *   image installs its browsers there and the setup script points gates at it.
  *   --install runs the repo's own `playwright install` for the missing builds
- *   into DIR, then checks again.
+ *   into DIR, then checks again. Not covered by tests: it downloads browsers
+ *   over the network; the post-install recheck is the same code the tests run.
  * Exit 0 all present, 1 drift, 2 cannot tell (no installed playwright, bad args).
  */
 import { spawnSync } from "node:child_process";

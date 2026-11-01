@@ -69,6 +69,18 @@ describe("isReadOnlyCommand: refusals replayed (67njw)", () => {
     "node -e 1",
     "GIT_PAGER=sh git log",
     "tee /repo/a",
+    "git show HEAD:a | tee out.txt",
+    "git branch -d main",
+    "git branch -m main other",
+    "git push origin HEAD",
+    "git reset --hard HEAD",
+    "rm /repo/a",
+    "cat /repo/a; rm /repo/a",
+    "cat /repo/a > out.txt; git checkout -- a",
+    "sort --compress-program=sh /repo/a",
+    "git log -p --textconv",
+    "xxd -r /repo/a out.bin",
+    "file -C -m magic",
   ])("does not allow %s", (command) => {
     expect(isReadOnlyCommand(command, opts).ok).toBe(false);
   });
@@ -98,5 +110,17 @@ describe("readonly-hook.mjs", () => {
     const r = spawnSync(process.execPath, [hook], { input: "{}", encoding: "utf8" });
     expect(r.status).not.toBe(0);
     expect(r.stderr).toMatch(/FAILED/);
+  });
+});
+
+describe("readOnlyHookCommand (diff-review wiring)", () => {
+  it("runs the hook with the repo and the chunk dir as roots, and the hook allows through it", async () => {
+    const { readOnlyHookCommand } = await import("../diff-review/diff-review.mjs");
+    const cmd = readOnlyHookCommand(READ, WRITE);
+    const r = spawnSync("sh", ["-c", cmd], {
+      input: JSON.stringify({ tool_name: "Bash", cwd: WRITE, tool_input: { command: "git branch -a" } }),
+      encoding: "utf8",
+    });
+    expect(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision).toBe("allow");
   });
 });

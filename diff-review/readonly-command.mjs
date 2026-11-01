@@ -18,9 +18,9 @@ import { isAbsolute, resolve } from "node:path";
 /** Commands that only read, whatever their arguments, except as checked below. */
 const READ_ONLY = new Set([
   "cat", "head", "tail", "wc", "ls", "grep", "egrep", "fgrep", "rg", "jq", "cut", "sort",
-  "uniq", "tr", "diff", "cmp", "comm", "file", "stat", "sha256sum", "sha1sum", "md5sum",
+  "uniq", "tr", "diff", "cmp", "comm", "stat", "sha256sum", "sha1sum", "md5sum",
   "pwd", "basename", "dirname", "realpath", "readlink", "nl", "tac", "rev", "column",
-  "fold", "od", "xxd", "expand", "echo", "printf", "true", "find", "sed", "git",
+  "fold", "od", "expand", "echo", "printf", "true", "find", "sed", "git",
 ]);
 
 /** git subcommands that only read. `branch` is checked further. */
@@ -140,7 +140,7 @@ function why(w, o) {
     case "find":
       return flag(/^-(exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)$/) ? "find that runs or writes" : "";
     case "sort":
-      return flag(/^(-o|--output|-[a-z]*o)/) ? "sort -o writes" : "";
+      return flag(/^(-o|--output|-[a-z]*o|--compress-program|--temporary-directory|-T)/) ? "sort flag that writes or runs a program" : "";
     case "rg":
       return flag(/^--pre/) ? "rg --pre runs a program" : "";
     case "git":
@@ -163,7 +163,7 @@ function gitWhy(args, o) {
   const sub = args[j];
   const rest = args.slice(j + 1);
   if (!GIT_READ.has(sub)) return `git ${sub} is not read-only`;
-  if (rest.some((a) => /^--(output|ext-diff|open-files-in-pager)|^-O/.test(a))) return `git ${sub} flag that writes or runs a program`;
+  if (rest.some((a) => /^--(output|ext-diff|textconv|open-files-in-pager)|^-O/.test(a))) return `git ${sub} flag that writes or runs a program`;
   if (sub === "branch") {
     for (let k = 0; k < rest.length; k += 1) {
       if (BRANCH_VALUE.has(rest[k])) k += 1;

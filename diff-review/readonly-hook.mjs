@@ -29,11 +29,13 @@ try {
 }
 const command = input?.tool_input?.command;
 if (input?.tool_name !== "Bash" || typeof command !== "string") process.exit(0);
-const verdict = isReadOnlyCommand(command, {
-  readRoots: [read, write],
-  writeRoot: write,
-  cwd: typeof input.cwd === "string" ? input.cwd : write,
-});
+// Claude Code always sends cwd; without it relative paths cannot be placed, so
+// give no decision and let the normal rules refuse, rather than guess a cwd.
+if (typeof input.cwd !== "string") {
+  console.error("readonly-hook: no cwd in hook input; no decision");
+  process.exit(0);
+}
+const verdict = isReadOnlyCommand(command, { readRoots: [read, write], writeRoot: write, cwd: input.cwd });
 if (verdict.ok) {
   process.stdout.write(
     JSON.stringify({
