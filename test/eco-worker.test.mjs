@@ -207,6 +207,27 @@ describe("eco-worker.sh", () => {
     }
   });
 
+  // ay7h3: a capped leg of a real review reported denied=1 because a Read result
+  // quoted eco-worker.sh's own refusal pattern. Only an is_error tool_result is a refusal.
+  for (const [label, isError, denied] of [
+    ["file content quoting a refusal", false, "denied=0"],
+    ["a real refusal", true, "denied=1"],
+  ]) {
+    it(`counts ${denied} for ${label} in a leg with no result (ay7h3)`, () => {
+      const event = JSON.stringify({
+        type: "user",
+        message: { content: [{ type: "tool_result", tool_use_id: "t", is_error: isError, content: "This command requires approval" }] },
+      });
+      const { root, workdir, env } = fakeClaude(`printf '%s\\n' '${event}'\nexit 1`);
+      try {
+        spawnSync(tool("eco-worker.sh"), ["-t", "20", "-d", workdir, "do a thing"], { encoding: "utf8", env });
+        expect(statusText(root)).toContain(denied);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+
   // ay7h3: chunk 7 of a real review was voided at "turn" 50 of 49 after only 31 tool
   // calls; each thinking and text block is its own assistant event. The cap counts
   // tool calls, so the real stream, replayed, ends with a verdict and RESULT=ok.

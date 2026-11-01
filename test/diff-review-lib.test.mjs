@@ -187,6 +187,14 @@ describe("buildPrompt", () => {
     expect(prompt).toContain("no cd");
   });
 
+  // ay7h3: a reviewer reached for WebFetch to check a claim about Claude Code hooks;
+  // the refusal voided its chunk. External-doc claims are untested, never a PASS alone.
+  it("says there is no web access and external-doc claims go under untested (ay7h3)", () => {
+    const prompt = buildPrompt({ base: "main", allowedCommands: ["git show"] });
+    expect(prompt).toContain("You have no web access: do not call WebFetch or WebSearch");
+    expect(prompt).toContain("a claim that rests on external documentation goes under `untested` and never counts as checked on its own");
+  });
+
   it("names absolute rule paths, the project, the files and the chunk", () => {
     const prompt = buildPrompt({
       base: "origin/main",

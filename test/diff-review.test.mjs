@@ -1193,7 +1193,7 @@ describe("review: quota guards", () => {
     const prompt = readFileSync(join(chunk, "repair-prompt"), "utf8");
     expect(prompt).toContain("verdict.json is not valid JSON");
     expect(prompt).toContain(join(chunk, "verdict.json"));
-    expect(Number(readFileSync(join(chunk, "repair-max-turns"), "utf8"))).toBeLessThanOrEqual(5);
+    expect(readFileSync(join(chunk, "repair-max-turns"), "utf8").trim()).toBe("5");
   });
 
   it("does not accept a repair turn that exits non-zero or hits a 429, even with a valid file (ay7h3)", async () => {
@@ -1214,6 +1214,26 @@ describe("review: quota guards", () => {
     });
     expect(result.parsed.ok).toBe(false);
     expect(result.parsed.error).toContain("rate limited (429)");
+  });
+
+  it("makes a repair leg that exits non-zero without a 429 an ERROR, even with a valid verdict (ay7h3)", async () => {
+    process.env.DIFF_REVIEW_WORKER = script(
+      "repair-exit1.sh",
+      repairWorker(`printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
+  exit 1`),
+    );
+    const repo = makeRepo("repair-exit1-");
+    const result = await review({
+      diff: `${fileSection("src/good.js")}\n`,
+      base: "main",
+      rules: defaultRules(),
+      outDir: join(repo, ".diff-review"),
+      blocking: false,
+      readRoot: repo,
+    });
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toContain("the verdict repair turn exited 1");
+    expect(result.parsed.error).not.toContain("429");
   });
 
   it("makes a verdict.json still invalid after the repair turn an ERROR, unpatched (ay7h3)", async () => {
