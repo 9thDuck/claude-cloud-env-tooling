@@ -1058,6 +1058,26 @@ fi
 printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"
 `;
 
+// ay7h3: the first leg writes the self-test's invalid verdict.json byte for byte; a
+// -r leg records its prompt and writes $REPAIR_WRITES (valid JSON, or the bad file again).
+const BAD_VERDICT = resolve(import.meta.dirname, "fixtures", "selftest-bad-verdict.json");
+function repairWorker(repairWrites) {
+  return `#!/usr/bin/env bash
+out="\${ECO_WORKER_LOG_DIR:?ECO_WORKER_LOG_DIR missing}"
+printf 'x\\n' >> "$out/attempts"
+if [ "$1" = -r ]; then
+  printf '%s\\n' "$2" > "$out/repair-run"
+  printf '%s\\n' "\${ECO_WORKER_MAX_TURNS:-}" > "$out/repair-max-turns"
+  printf '%s' "\${@: -1}" > "$out/repair-prompt"
+  ${repairWrites}
+  exit 0
+fi
+printf '%s\\n' 'eco-worker: RESULT=ok exit=0 run=run1' > "$out/run1.status"
+cp '${BAD_VERDICT}' "$out/verdict.json"
+exit 0
+`;
+}
+
 describe("review: quota guards", () => {
   let scriptsDir;
   let previousWorker;
@@ -1150,6 +1170,48 @@ describe("review: quota guards", () => {
     });
     expect(result.parsed).toMatchObject({ ok: true, verdict: "PASS" });
     expect(readFileSync(result.verdictMd, "utf8")).toContain("turn cap reached, but verdict.json is valid");
+  });
+
+  it("gives an invalid verdict.json one repair turn that sees the parse error (ay7h3)", async () => {
+    process.env.DIFF_REVIEW_WORKER = script(
+      "repair-ok.sh",
+      repairWorker(`printf '%s\\n' '{"verdict":"PASS","findings":[],"untested":[]}' > "$out/verdict.json"`),
+    );
+    const repo = makeRepo("repair-ok-");
+    const result = await review({
+      diff: `${fileSection("src/good.js")}\n`,
+      base: "main",
+      rules: defaultRules(),
+      outDir: join(repo, ".diff-review"),
+      blocking: false,
+      readRoot: repo,
+    });
+    expect(result.parsed).toMatchObject({ ok: true, verdict: "PASS" });
+    const chunk = join(result.dir, "chunks", "1");
+    expect(attemptsIn(result, 1)).toBe(2);
+    expect(readFileSync(join(chunk, "repair-run"), "utf8").trim()).toBe("run1");
+    const prompt = readFileSync(join(chunk, "repair-prompt"), "utf8");
+    expect(prompt).toContain("verdict.json is not valid JSON");
+    expect(prompt).toContain(join(chunk, "verdict.json"));
+    expect(Number(readFileSync(join(chunk, "repair-max-turns"), "utf8"))).toBeLessThanOrEqual(5);
+  });
+
+  it("makes a verdict.json still invalid after the repair turn an ERROR, unpatched (ay7h3)", async () => {
+    process.env.DIFF_REVIEW_WORKER = script("repair-bad.sh", repairWorker(`cp '${BAD_VERDICT}' "$out/verdict.json"`));
+    const repo = makeRepo("repair-bad-");
+    const result = await review({
+      diff: `${fileSection("src/good.js")}\n`,
+      base: "main",
+      rules: defaultRules(),
+      outDir: join(repo, ".diff-review"),
+      blocking: false,
+      readRoot: repo,
+    });
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toContain("invalid after one repair turn");
+    expect(attemptsIn(result, 1)).toBe(2);
+    // The tool never rewrites the reviewer's file.
+    expect(readFileSync(join(result.dir, "chunks", "1", "verdict.json"), "utf8")).toBe(readFileSync(BAD_VERDICT, "utf8"));
   });
 
   describe("a 52K chunk (planted: the old fixed 40-turn cap)", () => {
