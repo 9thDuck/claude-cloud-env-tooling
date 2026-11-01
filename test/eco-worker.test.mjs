@@ -50,6 +50,8 @@ describe("deny-hook.sh", () => {
     "git switch -c x --discard-changes",
     "git switch --det HEAD~1",
     "git checkout --deta abc123",
+    "git switch --det",
+    "git checkout --deta",
     "git checkout -b probe -",
     "git switch -c probe -",
     "git checkout -",
