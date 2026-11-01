@@ -435,7 +435,7 @@ function newestRunId(logDir) {
  * the file as valid JSON; the tool never edits the file itself. Still invalid,
  * or no leg to resume, is an ERROR.
  * @param {{ worker: string, workdir: string, logDir: string, verdictPath: string, parseError: string, timeoutSeconds: number, env: Record<string, string | undefined>, signal?: AbortSignal }} options
- * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
+ * @returns {Promise<{ ok: true } | { ok: false, error: string, rateLimited?: boolean, detail?: string }>}
  */
 async function repairVerdict({ worker, workdir, logDir, verdictPath, parseError, timeoutSeconds, env, signal }) {
   let runId;
@@ -456,6 +456,17 @@ Rewrite ${verdictPath} as valid JSON with the Write tool. Keep every verdict, fi
     env: { ...env, ECO_WORKER_MAX_TURNS: String(REPAIR_MAX_TURNS) },
   });
   if (result.error) return { ok: false, error: `${worker} could not start the repair turn: ${result.error.message}` };
+  // The repair leg is judged like any leg: a 429 is fatal for the review, and a
+  // failed leg is an ERROR even if the file now parses.
+  const evidence = logText(logDir);
+  if (evidence.unreadable.length > 0) return { ok: false, error: evidence.unreadable.join("; ") };
+  const rate = rateLimitDetail(evidence.text);
+  if (rate !== null) return { ok: false, rateLimited: true, detail: rate, error: `rate limited (429): ${rate}` };
+  if (result.status !== 0)
+    return {
+      ok: false,
+      error: `the verdict repair turn ${result.status === null ? `was killed by ${result.signal}` : `exited ${result.status}`}`,
+    };
   const repaired = readVerdictFile(verdictPath);
   if (repaired?.ok === true) return { ok: true };
   return {
@@ -615,7 +626,7 @@ async function runWorker({ workdir, readRoot, logDir, verdictPath, prompt, timeo
       });
       if (signal?.aborted)
         return { ok: false, cancelled: true, error: "cancelled after another chunk hit the rate limit", retried: attempt > 1 };
-      if (!repaired.ok) return { ok: false, error: repaired.error, retried: attempt > 1 };
+      if (!repaired.ok) return { ...repaired, retried: attempt > 1 };
       // The repair leg may itself have left a refused call.
       if (readdirSync(logDir).some((name) => name.endsWith(".blocked.md")))
         return { ok: false, blocked: true, error: "the verdict repair turn refused a call; a blocked review is not a review", retried: attempt > 1 };
